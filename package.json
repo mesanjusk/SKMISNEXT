@@ -3,6 +3,9 @@
   "version": "1.0.0",
   "private": true,
   "description": "MIS — unified Next.js app (UI + API + Socket.IO) for single-service deploy on Render.",
+  "engines": {
+    "node": ">=20"
+  },
   "scripts": {
     "dev": "cross-env NODE_ENV=development node server.js",
     "build": "next build",
@@ -78,7 +81,7 @@
     "eslint": "^9.8.0",
     "eslint-config-next": "^15.1.6",
     "jest": "^30.4.2",
-    "jsdom": "^30.0.1",
+    "jsdom": "^29.1.1",
     "mongodb-memory-server": "^11.2.0",
     "supertest": "^7.2.2",
     "vitest": "^4.1.10",
