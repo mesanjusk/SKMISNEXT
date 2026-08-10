@@ -1,0 +1,2106 @@
+/**
+ * DesignFiles.js  —  /api/design-files
+ *
+ * Watches the designer's synced Google Drive "0 Today" folder.
+ * Subfolders identified by leading numeric prefix (1, 2, 3 …)
+ *
+ * Folder map (your actual structure):
+ *   1 → New Design      2 → Old Design    3 → Hold
+ *   4 → Ready2Print     5 → Final         6 → Printing
+ *
+ * AUTO-MATCH: Files named "153 - CustomerName - Details - Mobile"
+ * Leading number = MIS Order_Number → auto-matched, zero manual work.
+ *
+ * Endpoints:
+ *   GET /api/design-files/config-check
+ *   GET /api/design-files/scan            — all files, auto-matched to orders
+ *   GET /api/design-files/unmatched       — files with no matching MIS order
+ *   GET /api/design-files/order/:uuid     — live stage of files for one order
+ *   POST /api/design-files/auto-temp-orders — create temp orders for unmatched files
+ *   GET /api/design-files/scan-archive    — scan month-wise archive folder
+ */
+
+const express = require('express');
+const router = express.Router();
+const { v4: uuidv4 } = require('uuid');
+const { requireAuth } = require('../middleware/auth');
+const { getAuthorizedDriveClient } = require('../services/googleDriveOAuthService');
+const Orders = require('../repositories/order');
+const VendorMaster = require('../repositories/vendorMaster');
+const PurchaseOrder = require('../repositories/purchaseOrder');
+const DesignFileLink = require('../repositories/DesignFileLink');
+const DesignProofLog = require('../repositories/DesignProofLog');
+const Customers = require('../repositories/customer');
+const Counter = require('../repositories/counter');
+const Usertasks = require('../repositories/usertask');
+const { postCustomerInvoice } = require('../services/accountingPostingService');
+const { upsertVendorJob } = require('../services/vendorJobService');
+const { assignOrderToUser } = require('../services/orderTaskService');
+const { sendWhatsAppText } = require('../services/unifiedWhatsAppService');
+const { normalizePhone } = require('../utils/phone');
+const { updateOrderStage } = require('../services/orderLifecycleService');
+const { ACCOUNT_PAYABLE_GROUP } = require('../constants/assignees');
+const logger = require('../utils/logger');
+
+router.use(requireAuth);
+
+// ─── Stage config ─────────────────────────────────────────────────────────────
+// Folder 7 (Approval) covers the MIS 'approval'/'customer' stages, which
+// never had a physical folder before — create "7.Approval" alongside the
+// existing 1-6 folders in Drive to use it. Folders 5 (Final) and 6
+// (Printing) intentionally have no MIS-stage counterpart below: those are
+// driven by the explicit Confirm Final / Create Print Job actions instead
+// of by folder location.
+const STAGE_LABELS = {
+  1: 'New Design', 2: 'Old Design', 3: 'Hold',
+  4: 'Ready2Print', 5: 'Final', 6: 'Printing', 7: 'Approval',
+};
+const STAGE_COLORS = {
+  1: { bg: '#E3F2FD', color: '#0D47A1' },
+  2: { bg: '#F3E5F5', color: '#4A148C' },
+  3: { bg: '#FBE9E7', color: '#BF360C' },
+  4: { bg: '#E8F5E9', color: '#1B5E20' },
+  5: { bg: '#E0F2F1', color: '#004D40' },
+  6: { bg: '#FCE4EC', color: '#880E4F' },
+  7: { bg: '#FFF3E0', color: '#E65100' },
+};
+function stageLabel(n) { return STAGE_LABELS[n] || `Stage ${n}`; }
+function stageColor(n) { return STAGE_COLORS[n] || { bg: '#F5F5F5', color: '#424242' }; }
+
+// Folder → MIS order.stage, for auto-syncing order.stage to wherever a
+// designer has physically moved the file in Drive — the folder is the
+// source of truth for these stages, no manual "move to stage" needed.
+const FOLDER_STAGE_TO_ORDER_STAGE = {
+  1: 'new_design',
+  2: 'old_design',
+  3: 'hold',
+  4: 'ready_to_print',
+  7: 'approval',
+};
+
+// Stages a design-loop folder move is allowed to sync *out of* — anything
+// already in production (print onward) or closed is left alone even if a
+// stray file for that order still sits in an earlier design folder, so a
+// forgotten Drive file can never drag a finished order backward.
+const SYNCABLE_CURRENT_STAGES = new Set([
+  'enquiry', 'quoted', 'approved',
+  'new_design', 'old_design', 'approval', 'hold', 'customer', 'ready_to_print',
+]);
+
+// Writes each matched file's folder-detected stage back onto its linked
+// order when the two disagree, so order.stage — used everywhere else in the
+// app (reports, the Workflow board's Print/Post Print/Ready columns) —
+// stays truthful once someone starts moving files between Drive folders
+// instead of drifting from whatever stage the order was created at.
+// Mutates matching entries of `files` in place with the new orderStage so
+// the response this request returns is already up to date. Best-effort:
+// failures are logged and skipped, never fail the scan itself.
+async function syncOrderStagesFromFolders(files) {
+  const candidates = files.filter((f) => {
+    const target = FOLDER_STAGE_TO_ORDER_STAGE[f.stageNumber];
+    return f.matched && f.orderUuid && target && target !== f.orderStage && SYNCABLE_CURRENT_STAGES.has(f.orderStage || 'enquiry');
+  });
+  if (!candidates.length) return;
+
+  await Promise.allSettled(candidates.map(async (file) => {
+    const target = FOLDER_STAGE_TO_ORDER_STAGE[file.stageNumber];
+    try {
+      await updateOrderStage({ orderId: file.orderUuid, stage: target });
+      file.orderStage = target;
+    } catch (err) {
+      logger.warn('design-files/scan: folder-driven stage sync failed for order %s -> %s — %s', file.orderNumber, target, err?.message);
+    }
+  }));
+}
+
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+
+/** "2.Old Design" → 2 */
+function folderStageNumber(name = '') {
+  const m = String(name).match(/^(\d+)/);
+  return m ? parseInt(m[1], 10) : null;
+}
+
+/**
+ * Extract MIS order number from filename.
+ * Handles: "153 - Name", "153-Name", "153_Name", "ORD153", "ORD-153"
+ */
+function extractOrderNumber(fileName = '') {
+  const m = String(fileName).match(/^(\d+)\s*[-_\s]/);
+  if (m) return parseInt(m[1], 10);
+  const m2 = String(fileName).match(/ORD[-]?(\d+)/i);
+  if (m2) return parseInt(m2[1], 10);
+  return null;
+}
+
+/**
+ * Returns true only if the filename already starts with EXACTLY the given
+ * order number followed by a separator (space, dash, underscore).
+ * Prevents "1534 - file.cdr" from being considered already-prefixed for order #153.
+ */
+function alreadyPrefixedWithOrder(fileName, orderNumber) {
+  if (!fileName || orderNumber == null) return false;
+  return new RegExp(`^${orderNumber}[\\s\\-_]`).test(String(fileName));
+}
+
+/**
+ * Returns true for backup/temp files that should never appear in the scan.
+ * Patterns:
+ *   ~$*           — Office lock files (Word, Excel, CorelDraw)
+ *   .*            — hidden / system dot-files
+ *   *.bak *.tmp *.~ — explicit backup extensions
+ *   * - Copy*     — Windows "copy" duplicates
+ *   Copy of *     — macOS "copy" duplicates
+ *   *(copy)*      — generic copy suffix
+ *   *backup*      — any file with "backup" in the name
+ *   *.lck         — lock files
+ */
+function isBackupFile(name = '') {
+  const n = String(name);
+  if (n.startsWith('~$')) return true;
+  if (n.startsWith('.')) return true;
+  const lower = n.toLowerCase();
+  if (lower.endsWith('.bak') || lower.endsWith('.tmp') || lower.endsWith('.~') || lower.endsWith('.lck')) return true;
+  if (lower.includes(' - copy') || lower.startsWith('copy of ')) return true;
+  if (lower.includes('(copy)') || lower.includes('backup')) return true;
+  return false;
+}
+
+/** List immediate children of a Drive folder (excludes backup files) */
+async function listChildren(drive, folderId, mimeTypeFilter = null) {
+  const q = [`'${folderId}' in parents`, `trashed = false`];
+  if (mimeTypeFilter) q.push(`mimeType = '${mimeTypeFilter}'`);
+  const res = await drive.files.list({
+    q: q.join(' and '),
+    fields: 'files(id,name,mimeType,modifiedTime,createdTime,size)',
+    pageSize: 500,
+    supportsAllDrives: true,
+    includeItemsFromAllDrives: true,
+  });
+  const files = res.data.files || [];
+  // Skip backup/temp files unless we are listing folders
+  if (mimeTypeFilter === 'application/vnd.google-apps.folder') return files;
+  return files.filter((f) => !isBackupFile(f.name));
+}
+
+/**
+ * Fixed UUID reserved for the auto-generated "Temp – Design File" customer.
+ * Override via TEMP_CUSTOMER_UUID env var if you want to use an existing customer.
+ */
+const TEMP_CUSTOMER_UUID = process.env.TEMP_CUSTOMER_UUID || 'ffffffff-0000-temp-0000-d51gn00000001';
+
+/** Find or create the placeholder customer used for temporary orders. */
+async function getOrCreateTempCustomer() {
+  const existing = await Customers.findOne({ Customer_uuid: TEMP_CUSTOMER_UUID }).lean();
+  if (existing) return existing;
+  return Customers.create({
+    Customer_uuid: TEMP_CUSTOMER_UUID,
+    Customer_name: 'Temp – Design File',
+    Customer_group: 'Temp',
+    Mobile_number: '0000000000',
+    Status: 'Active',
+  });
+}
+
+/** Get the next order number using the shared counter. */
+async function nextOrderNumber() {
+  const lastOrder = await Orders.findOne({}, { Order_Number: 1 }).sort({ Order_Number: -1 }).lean();
+  const seed = Number(lastOrder?.Order_Number || 0);
+  await Counter.updateOne({ _id: 'order_number' }, { $max: { seq: seed } }, { upsert: true });
+  const updated = await Counter.findByIdAndUpdate(
+    'order_number',
+    { $inc: { seq: 1 } },
+    { new: true, upsert: true, setDefaultsOnInsert: true }
+  ).lean();
+  return Number(updated?.seq || 1);
+}
+
+// ─── New helpers ──────────────────────────────────────────────────────────────
+
+const SUSPENSE_VENDOR_UUID = process.env.SUSPENSE_VENDOR_UUID || 'ffffffff-0000-susp-0000-v3nd0r0000001';
+
+async function getOrCreateSuspenseVendor() {
+  const existing = await VendorMaster.findOne({ Vendor_uuid: SUSPENSE_VENDOR_UUID }).lean();
+  if (existing) return existing;
+  return VendorMaster.create({
+    Vendor_uuid: SUSPENSE_VENDOR_UUID,
+    Vendor_name: 'Suspense Printer',
+    Mobile_number: '0000000000',
+    Vendor_type: 'mixed',
+    Active: true,
+  });
+}
+
+function sanitize(v) {
+  return String(v || '').replace(/[\\/:*?"<>|#%{}~&]/g, ' ').replace(/\s+/g, ' ').trim();
+}
+
+/**
+ * Augment a flat file list with DesignFileLink matches for files that were not
+ * auto-matched by filename. Returns the enriched array with `matched` updated.
+ * Also handles draft links (no orderUuid yet) and print job metadata.
+ */
+async function applyLinks(enriched) {
+  const unmatchedIds = enriched.filter((f) => !f.matched).map((f) => f.fileId);
+  if (!unmatchedIds.length) return enriched;
+
+  const links = await DesignFileLink.find(
+    { driveFileId: { $in: unmatchedIds } },
+    { driveFileId: 1, orderUuid: 1, orderNumber: 1, linkStatus: 1, customerName: 1, printJobId: 1, printJobNumber: 1 }
+  ).lean();
+  if (!links.length) return enriched;
+
+  const linkMap = {};
+  links.forEach((l) => { linkMap[l.driveFileId] = l; });
+
+  const linkedUuids = links.map((l) => l.orderUuid).filter(Boolean);
+  const linkedOrders = linkedUuids.length
+    ? await Orders.find({ Order_uuid: { $in: linkedUuids } }, { Order_uuid: 1, Order_Number: 1, stage: 1, Amount: 1 }).lean()
+    : [];
+  const orderByUuid = {};
+  linkedOrders.forEach((o) => { orderByUuid[o.Order_uuid] = o; });
+
+  return enriched.map((file) => {
+    if (file.matched) return file;
+    const link = linkMap[file.fileId];
+    if (!link) return file;
+
+    // Draft — tracked but no order yet
+    if (!link.orderUuid || link.linkStatus === 'draft') {
+      return { ...file, isDraft: true, linkStatus: 'draft', linkedViaLink: true };
+    }
+
+    const order = orderByUuid[link.orderUuid];
+    if (!order) return file;
+    return {
+      ...file,
+      matched: true,
+      orderUuid: order.Order_uuid,
+      orderNumber: order.Order_Number,
+      orderStage: order.stage,
+      orderAmount: order.Amount,
+      customerName: link.customerName || null,
+      linkStatus: link.linkStatus || 'confirmed',
+      linkedViaManual: true,
+      printJobId: link.printJobId || null,
+      printJobNumber: link.printJobNumber || null,
+    };
+  });
+}
+
+/**
+ * Merges assignedTo/assignedToName onto every file that has an active
+ * DesignFileLink assignment, regardless of whether the file is matched to a
+ * real order — assignment is independent of the order-matching lifecycle.
+ */
+async function applyAssignments(enriched) {
+  const ids = enriched.map((f) => f.fileId);
+  if (!ids.length) return enriched;
+
+  const links = await DesignFileLink.find(
+    { driveFileId: { $in: ids }, assignedTo: { $ne: null } },
+    { driveFileId: 1, assignedTo: 1, assignedToType: 1, assignedToName: 1, assignedBy: 1, assignedAt: 1 }
+  ).lean();
+  if (!links.length) return enriched;
+
+  const map = {};
+  links.forEach((l) => { map[l.driveFileId] = l; });
+
+  return enriched.map((file) => {
+    const link = map[file.fileId];
+    if (!link) return file;
+    return {
+      ...file,
+      assignedTo: String(link.assignedTo),
+      assignedToType: link.assignedToType || 'user',
+      assignedToName: link.assignedToName,
+      assignedBy: link.assignedBy,
+      assignedAt: link.assignedAt,
+    };
+  });
+}
+
+// ─── GET /api/design-files/config-check ──────────────────────────────────────
+router.get('/config-check', (_req, res) => {
+  return res.json({
+    configured: !!process.env.DRIVE_DAILY_FOLDER_ID,
+    archiveConfigured: !!process.env.DRIVE_ARCHIVE_FOLDER_ID,
+  });
+});
+
+// ─── GET /api/design-files/scan ──────────────────────────────────────────────
+router.get('/scan', async (_req, res) => {
+  try {
+    const dailyFolderId = process.env.DRIVE_DAILY_FOLDER_ID;
+    if (!dailyFolderId) {
+      return res.status(400).json({ success: false, message: 'DRIVE_DAILY_FOLDER_ID not configured' });
+    }
+
+    const drive = await getAuthorizedDriveClient();
+
+    // 1. Get all numbered subfolders
+    const allFolders = await listChildren(drive, dailyFolderId, 'application/vnd.google-apps.folder');
+    const numbered = allFolders
+      .map((f) => ({ ...f, stageNumber: folderStageNumber(f.name) }))
+      .filter((f) => f.stageNumber !== null)
+      .sort((a, b) => a.stageNumber - b.stageNumber);
+
+    // 2. List files in all subfolders in parallel (backup files already excluded by listChildren)
+    const folderScans = await Promise.all(
+      numbered.map(async (folder) => {
+        const files = await listChildren(drive, folder.id);
+        return files.map((file) => ({
+          fileId: file.id,
+          fileName: file.name,
+          mimeType: file.mimeType,
+          modifiedTime: file.modifiedTime,
+          createdTime: file.createdTime,
+          size: file.size || null,
+          folderName: folder.name,
+          stageNumber: folder.stageNumber,
+          stageLabel: stageLabel(folder.stageNumber),
+          stageColor: stageColor(folder.stageNumber),
+          extractedOrderNumber: extractOrderNumber(file.name),
+        }));
+      })
+    );
+
+    const allFiles = folderScans.flat();
+
+    // 3. Batch-fetch all matching orders from MIS (by filename-extracted number)
+    const orderNumbers = [...new Set(allFiles.map((f) => f.extractedOrderNumber).filter(Boolean))];
+    const orders = orderNumbers.length
+      ? await Orders.find(
+          { Order_Number: { $in: orderNumbers } },
+          { Order_uuid: 1, Order_Number: 1, stage: 1, Amount: 1, orderNote: 1, isTemporary: 1, Customer_uuid: 1 }
+        ).lean()
+      : [];
+    const orderByNumber = {};
+    orders.forEach((o) => { orderByNumber[o.Order_Number] = o; });
+
+    // Customer names for the assign menu / row badges — orders only carry
+    // Customer_uuid, so resolve display names once per batch here.
+    const customerUuids = [...new Set(orders.map((o) => o.Customer_uuid).filter(Boolean))];
+    const customerNameByUuid = {};
+    if (customerUuids.length) {
+      const customerDocs = await Customers.find(
+        { Customer_uuid: { $in: customerUuids } },
+        { Customer_uuid: 1, Customer_name: 1 }
+      ).lean();
+      customerDocs.forEach((c) => { customerNameByUuid[c.Customer_uuid] = c.Customer_name; });
+    }
+
+    // 4. Enrich files with matched order data (filename-based matching)
+    let enriched = allFiles.map((file) => {
+      const order = file.extractedOrderNumber ? orderByNumber[file.extractedOrderNumber] || null : null;
+      return {
+        ...file,
+        matched: !!order,
+        orderUuid: order?.Order_uuid || null,
+        orderNumber: order?.Order_Number || file.extractedOrderNumber || null,
+        orderStage: order?.stage || null,
+        orderAmount: order?.Amount || null,
+        isTemporaryOrder: order?.isTemporary || false,
+        customerName: order ? customerNameByUuid[order.Customer_uuid] || null : null,
+        linkedViaManual: false,
+      };
+    });
+
+    // 5. For still-unmatched files, check DesignFileLink (manual links override)
+    enriched = await applyLinks(enriched);
+
+    // 5b. Merge in any file assignments (independent of order-matching)
+    enriched = await applyAssignments(enriched);
+
+    // 5c. Auto-sync order.stage to match wherever the file physically sits
+    // in Drive (design-loop folders only — see syncOrderStagesFromFolders).
+    await syncOrderStagesFromFolders(enriched);
+
+    // 6. Build summary
+    const summary = {
+      total: enriched.length,
+      matched: enriched.filter((f) => f.matched).length,
+      unmatched: enriched.filter((f) => !f.matched).length,
+      byStage: {},
+    };
+    numbered.forEach((folder) => {
+      const stageFiles = enriched.filter((f) => f.stageNumber === folder.stageNumber);
+      summary.byStage[folder.stageNumber] = {
+        label: stageLabel(folder.stageNumber),
+        count: stageFiles.length,
+        matched: stageFiles.filter((f) => f.matched).length,
+      };
+    });
+
+    // 7. Stale draft links — draft records whose file is no longer visible in today's Drive scan
+    const currentFileIds = new Set(enriched.map((f) => f.fileId));
+    const staleLinks = await DesignFileLink.find(
+      { linkStatus: 'draft', driveFileId: { $nin: [...currentFileIds] } },
+      { driveFileId: 1, fileName: 1, stageNumber: 1, stageLabel: 1, linkedAt: 1 }
+    ).lean();
+
+    return res.json({ success: true, files: enriched, summary, staleLinks });
+  } catch (err) {
+    logger.error({ err }, 'design-files/scan error');
+    if (err?.reconnectRequired) {
+      return res.status(401).json({ success: false, message: 'Google Drive disconnected. Please reconnect.', reconnectRequired: true });
+    }
+    return res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// ─── GET /api/design-files/unmatched ─────────────────────────────────────────
+router.get('/unmatched', async (_req, res) => {
+  try {
+    const dailyFolderId = process.env.DRIVE_DAILY_FOLDER_ID;
+    if (!dailyFolderId) {
+      return res.status(400).json({ success: false, message: 'DRIVE_DAILY_FOLDER_ID not configured' });
+    }
+    const drive = await getAuthorizedDriveClient();
+    const allFolders = await listChildren(drive, dailyFolderId, 'application/vnd.google-apps.folder');
+    const numbered = allFolders
+      .map((f) => ({ ...f, stageNumber: folderStageNumber(f.name) }))
+      .filter((f) => f.stageNumber !== null);
+
+    const folderScans = await Promise.all(
+      numbered.map(async (folder) => {
+        const files = await listChildren(drive, folder.id);
+        return files.map((file) => ({
+          fileId: file.id,
+          fileName: file.name,
+          modifiedTime: file.modifiedTime,
+          createdTime: file.createdTime,
+          stageNumber: folder.stageNumber,
+          stageLabel: stageLabel(folder.stageNumber),
+          stageColor: stageColor(folder.stageNumber),
+          extractedOrderNumber: extractOrderNumber(file.name),
+        }));
+      })
+    );
+
+    const allFiles = folderScans.flat();
+    const orderNumbers = [...new Set(allFiles.map((f) => f.extractedOrderNumber).filter(Boolean))];
+    const found = orderNumbers.length
+      ? await Orders.find({ Order_Number: { $in: orderNumbers } }, { Order_Number: 1 }).lean()
+      : [];
+    const foundSet = new Set(found.map((o) => o.Order_Number));
+
+    // Also check DesignFileLink for any manually linked files
+    const allFileIds = allFiles.map((f) => f.fileId);
+    const manualLinks = allFileIds.length
+      ? await DesignFileLink.find({ driveFileId: { $in: allFileIds } }, { driveFileId: 1 }).lean()
+      : [];
+    const manuallyLinkedIds = new Set(manualLinks.map((l) => l.driveFileId));
+
+    const unmatched = allFiles.filter(
+      (f) => !manuallyLinkedIds.has(f.fileId) && (!f.extractedOrderNumber || !foundSet.has(f.extractedOrderNumber))
+    );
+    return res.json({ success: true, files: unmatched, count: unmatched.length });
+  } catch (err) {
+    logger.error({ err }, 'design-files/unmatched error');
+    return res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// ─── GET /api/design-files/order/:orderUuid ──────────────────────────────────
+router.get('/order/:orderUuid', async (req, res) => {
+  try {
+    const order = await Orders.findOne({ Order_uuid: req.params.orderUuid }, { Order_Number: 1 }).lean();
+    if (!order) return res.status(404).json({ success: false, message: 'Order not found' });
+
+    const dailyFolderId = process.env.DRIVE_DAILY_FOLDER_ID;
+    if (!dailyFolderId) return res.json({ success: true, files: [] });
+
+    const drive = await getAuthorizedDriveClient();
+    const allFolders = await listChildren(drive, dailyFolderId, 'application/vnd.google-apps.folder');
+    const numbered = allFolders
+      .map((f) => ({ ...f, stageNumber: folderStageNumber(f.name) }))
+      .filter((f) => f.stageNumber !== null);
+
+    const matches = [];
+    await Promise.all(
+      numbered.map(async (folder) => {
+        const files = await listChildren(drive, folder.id);
+        files.forEach((file) => {
+          if (extractOrderNumber(file.name) === order.Order_Number) {
+            matches.push({
+              fileId: file.id,
+              fileName: file.name,
+              modifiedTime: file.modifiedTime,
+              createdTime: file.createdTime,
+              stageNumber: folder.stageNumber,
+              stageLabel: stageLabel(folder.stageNumber),
+              stageColor: stageColor(folder.stageNumber),
+              folderName: folder.name,
+            });
+          }
+        });
+      })
+    );
+
+    matches.sort((a, b) => a.stageNumber - b.stageNumber);
+    return res.json({ success: true, orderNumber: order.Order_Number, files: matches });
+  } catch (err) {
+    logger.error({ err }, 'design-files/order error');
+    return res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// ─── GET /api/design-files/orders/search?q= ──────────────────────────────────
+router.get('/orders/search', async (req, res) => {
+  try {
+    const q = String(req.query.q || '').trim();
+    const num = Number(q);
+    const filter = q
+      ? {
+          $or: [
+            ...(Number.isFinite(num) && num > 0 ? [{ Order_Number: num }] : []),
+            { orderNote: { $regex: q, $options: 'i' } },
+          ],
+        }
+      : {};
+    const orders = await Orders.find(filter, {
+      Order_uuid: 1, Order_Number: 1, orderNote: 1, stage: 1, isTemporary: 1, Customer_uuid: 1,
+    })
+      .sort({ Order_Number: -1 })
+      .limit(20)
+      .lean();
+
+    const cuuids = [...new Set(orders.map((o) => o.Customer_uuid).filter(Boolean))];
+    const custDocs = cuuids.length
+      ? await Customers.find({ Customer_uuid: { $in: cuuids } }, { Customer_uuid: 1, Customer_name: 1 }).lean()
+      : [];
+    const custMap = {};
+    custDocs.forEach((c) => { custMap[c.Customer_uuid] = c.Customer_name; });
+
+    return res.json({
+      success: true,
+      result: orders.map((o) => ({ ...o, customerName: custMap[o.Customer_uuid] || null })),
+    });
+  } catch (err) {
+    logger.error({ err }, 'design-files/orders/search error');
+    return res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// ─── POST /api/design-files/link-order ───────────────────────────────────────
+router.post('/link-order', async (req, res) => {
+  try {
+    const { fileIds, orderUuid, files: filesMeta = [] } = req.body || {};
+    if (!Array.isArray(fileIds) || !fileIds.length) {
+      return res.status(400).json({ success: false, message: 'fileIds required' });
+    }
+    if (!orderUuid) {
+      return res.status(400).json({ success: false, message: 'orderUuid required' });
+    }
+
+    const order = await Orders.findOne({ Order_uuid: orderUuid }, {
+      Order_uuid: 1, Order_Number: 1, Customer_uuid: 1, orderNote: 1,
+    }).lean();
+    if (!order) return res.status(404).json({ success: false, message: 'Order not found' });
+
+    const metaMap = {};
+    filesMeta.forEach((f) => { if (f?.fileId) metaMap[f.fileId] = f; });
+
+    // Save link records first — link always succeeds even if rename fails
+    const ops = fileIds.map((fileId) => {
+      const meta = metaMap[fileId] || {};
+      return {
+        updateOne: {
+          filter: { driveFileId: fileId },
+          update: {
+            $set: {
+              orderUuid: order.Order_uuid,
+              orderNumber: order.Order_Number,
+              fileName: meta.fileName || null,
+              stageNumber: meta.stageNumber || null,
+              stageLabel: meta.stageLabel || null,
+              linkedAt: new Date(),
+            },
+          },
+          upsert: true,
+        },
+      };
+    });
+
+    await DesignFileLink.bulkWrite(ops);
+
+    // Drive rename — isolated so it can never cause a 500 on the link itself
+    const renameResults = {};
+    try {
+      let drive = null;
+      try { drive = await getAuthorizedDriveClient(); } catch (_) { /* no Drive auth — skip */ }
+
+      if (drive) {
+        for (const fileId of fileIds) {
+          const meta = metaMap[fileId] || {};
+          const currentName = meta.fileName || '';
+
+          if (alreadyPrefixedWithOrder(currentName, order.Order_Number)) {
+            renameResults[fileId] = { status: 'skipped' };
+            continue;
+          }
+
+          const newName = `${order.Order_Number} - ${currentName}`;
+          try {
+            await drive.files.update({
+              fileId,
+              supportsAllDrives: true,
+              requestBody: { name: newName },
+              fields: 'id,name',
+            });
+            await DesignFileLink.updateOne({ driveFileId: fileId }, { $set: { fileName: newName } });
+            renameResults[fileId] = { status: 'renamed', newName };
+          } catch (renameErr) {
+            const msg = renameErr?.errors?.[0]?.message || renameErr?.message || 'Rename failed';
+            logger.warn('design-files/link-order: Drive rename failed for %s — %s', fileId, msg);
+            renameResults[fileId] = { status: 'failed', error: msg };
+          }
+        }
+      }
+    } catch (renameBlockErr) {
+      logger.warn('design-files/link-order: rename block error — %s', renameBlockErr?.message);
+    }
+
+    return res.json({ success: true, linked: fileIds.length, orderNumber: order.Order_Number, renameResults });
+  } catch (err) {
+    logger.error({ err }, 'design-files/link-order error');
+    return res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// ─── POST /api/design-files/rename-file ──────────────────────────────────────
+/**
+ * Retry just the Drive rename for a single file (e.g. after closing it in CorelDraw).
+ * Body: { fileId, fileName, orderNumber }
+ */
+router.post('/rename-file', async (req, res) => {
+  try {
+    const { fileId, fileName, orderNumber } = req.body || {};
+    if (!fileId) return res.status(400).json({ success: false, message: 'fileId required' });
+    if (!fileName) return res.status(400).json({ success: false, message: 'fileName required' });
+    if (orderNumber == null) return res.status(400).json({ success: false, message: 'orderNumber required' });
+
+    if (alreadyPrefixedWithOrder(fileName, orderNumber)) {
+      return res.json({ success: true, status: 'skipped', message: `Filename already starts with Order #${orderNumber}` });
+    }
+
+    const newName = `${orderNumber} - ${fileName}`;
+
+    let drive;
+    try {
+      drive = await getAuthorizedDriveClient();
+    } catch (authErr) {
+      if (authErr?.reconnectRequired) {
+        return res.status(401).json({ success: false, message: 'Google Drive disconnected. Please reconnect.', reconnectRequired: true });
+      }
+      throw authErr;
+    }
+
+    try {
+      await drive.files.update({
+        fileId,
+        supportsAllDrives: true,
+        requestBody: { name: newName },
+        fields: 'id,name',
+      });
+    } catch (renameErr) {
+      const msg = renameErr?.errors?.[0]?.message || renameErr.message || 'Rename failed';
+      logger.warn({ fileId, err: renameErr }, 'design-files/rename-file: Drive rename failed');
+      return res.json({
+        success: false,
+        status: 'failed',
+        message: `File linked to Order #${orderNumber} but rename failed — please close the file in CorelDraw and try again, or rename manually`,
+        driveError: msg,
+      });
+    }
+
+    // Update stored fileName
+    await DesignFileLink.updateOne({ driveFileId: fileId }, { $set: { fileName: newName } });
+
+    return res.json({ success: true, status: 'renamed', newName });
+  } catch (err) {
+    logger.error({ err }, 'design-files/rename-file error');
+    return res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// ─── POST /api/design-files/create-file ──────────────────────────────────────
+/**
+ * "+" button next to Refresh — copies the same template file used by
+ * /orders/new into the "1 New Design" Drive folder, renamed to whatever the
+ * user typed. Google Drive Desktop then syncs it down to the local machine
+ * the same way order-created files already do.
+ *
+ * Body: { fileName }
+ */
+router.post('/create-file', async (req, res) => {
+  try {
+    const fileName = String(req.body?.fileName || '').trim();
+    if (!fileName) return res.status(400).json({ success: false, message: 'fileName required' });
+
+    const templateFileId = process.env.DRIVE_TEMPLATE_FILE_ID;
+    if (!templateFileId) return res.status(400).json({ success: false, message: 'DRIVE_TEMPLATE_FILE_ID not configured' });
+
+    const dailyFolderId = process.env.DRIVE_DAILY_FOLDER_ID;
+    if (!dailyFolderId) return res.status(400).json({ success: false, message: 'DRIVE_DAILY_FOLDER_ID not configured' });
+
+    let drive;
+    try {
+      drive = await getAuthorizedDriveClient();
+    } catch (authErr) {
+      if (authErr?.reconnectRequired) {
+        return res.status(401).json({ success: false, message: 'Google Drive disconnected. Please reconnect.', reconnectRequired: true });
+      }
+      throw authErr;
+    }
+
+    const allFolders = await listChildren(drive, dailyFolderId, 'application/vnd.google-apps.folder');
+    const newDesignFolder = allFolders.find((f) => folderStageNumber(f.name) === 1);
+    if (!newDesignFolder) {
+      return res.status(404).json({ success: false, message: '"1 - New Design" folder not found in Drive' });
+    }
+
+    const safeName = sanitize(fileName);
+    const finalName = /\.[a-zA-Z0-9]{2,5}$/.test(safeName) ? safeName : `${safeName}.cdr`;
+
+    const response = await drive.files.copy({
+      fileId: templateFileId,
+      supportsAllDrives: true,
+      includeItemsFromAllDrives: true,
+      requestBody: { name: finalName, parents: [newDesignFolder.id] },
+      fields: 'id,name,parents,webViewLink',
+    });
+
+    return res.json({ success: true, file: response.data });
+  } catch (err) {
+    logger.error({ err }, 'design-files/create-file error');
+    if (err?.reconnectRequired) {
+      return res.status(401).json({ success: false, message: 'Google Drive disconnected. Please reconnect.', reconnectRequired: true });
+    }
+    return res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// ─── POST /api/design-files/assign ───────────────────────────────────────────
+/**
+ * Assigns a design file to an Account Payable party (Customers, tagged with
+ * the 'design' capability — same source as the order task-assign menu, see
+ * MISBackend/src/routes/Assignees.js) — works even if the file has no MIS
+ * order yet (standalone assignment tracked on DesignFileLink). If the file
+ * is already linked to a real order, also runs the existing order-level
+ * assignment (dashboard task lists). Either way, the Drive file is renamed
+ * to tag the assignee's name so the assignment is visible in the local
+ * (Drive Desktop synced) folder too.
+ *
+ * Body: { fileId, fileName, orderUuid?, orderNumber?, assigneeId, assignedBy }
+ */
+router.post('/assign', async (req, res) => {
+  try {
+    const { fileId, fileName, orderUuid, assigneeId, assignedBy } = req.body || {};
+    if (!fileId) return res.status(400).json({ success: false, message: 'fileId required' });
+    if (!assigneeId) return res.status(400).json({ success: false, message: 'assigneeId required' });
+
+    const party = await Customers.findById(assigneeId);
+    if (!party) return res.status(404).json({ success: false, message: 'Account Payable party not found' });
+
+    const resolvedAssignedBy = assignedBy || req.user?.userName || 'System';
+
+    await DesignFileLink.updateOne(
+      { driveFileId: fileId },
+      {
+        $set: {
+          assignedTo: party._id,
+          assignedToType: 'vendor',
+          assignedToName: party.Customer_name,
+          assignedBy: resolvedAssignedBy,
+          assignedAt: new Date(),
+          ...(fileName ? { fileName } : {}),
+        },
+        $setOnInsert: { linkStatus: 'draft' },
+      },
+      { upsert: true }
+    );
+
+    if (orderUuid) {
+      try {
+        await assignOrderToUser({ orderId: orderUuid, vendorId: party._id, assignedBy: resolvedAssignedBy, via: 'design-file' });
+      } catch (orderErr) {
+        logger.warn('design-files/assign: order-level assign failed — %s', orderErr.message);
+      }
+    }
+
+    // Rename Drive file to tag the assignee — isolated, never fails the assign.
+    let renamed = false;
+    let newName = fileName || null;
+    try {
+      const drive = await getAuthorizedDriveClient();
+      const current = fileName || '';
+      const alreadyTagged = new RegExp(`\\[${party.Customer_name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\]`, 'i').test(current);
+      if (current && !alreadyTagged) {
+        const dot = current.lastIndexOf('.');
+        const base = dot !== -1 ? current.slice(0, dot) : current;
+        const ext = dot !== -1 ? current.slice(dot) : '';
+        newName = `${base} [${party.Customer_name}]${ext}`;
+        await drive.files.update({
+          fileId,
+          supportsAllDrives: true,
+          requestBody: { name: newName },
+          fields: 'id,name',
+        });
+        await DesignFileLink.updateOne({ driveFileId: fileId }, { $set: { fileName: newName } });
+        renamed = true;
+      }
+    } catch (renameErr) {
+      logger.warn('design-files/assign: Drive rename failed — %s', renameErr?.message);
+    }
+
+    return res.json({ success: true, assignedToName: party.Customer_name, renamed, newName });
+  } catch (err) {
+    logger.error({ err }, 'design-files/assign error');
+    return res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// ─── POST /api/design-files/auto-temp-orders ─────────────────────────────────
+/**
+ * For each unmatched file passed in, creates a temporary placeholder order and
+ * a DesignFileLink record so the file is tracked in MIS immediately.
+ * The user can open the temp order later and fill in the real customer/amount.
+ *
+ * Body: { files: [{ fileId, fileName, stageNumber, stageLabel, stageColor }], fromArchive }
+ * fromArchive: the files came from the Design Files "Archive" tab (already-
+ * printed historical jobs), so the new order skips design and starts at
+ * 'print' instead of the usual 'new_design'.
+ */
+router.post('/auto-temp-orders', async (req, res) => {
+  try {
+    const { files = [], fromArchive } = req.body || {};
+    const initialStage = fromArchive ? 'print' : 'new_design';
+    if (!Array.isArray(files) || !files.length) {
+      return res.status(400).json({ success: false, message: 'files array is required' });
+    }
+
+    // Skip files that already have a DesignFileLink record
+    const fileIds = files.map((f) => f.fileId).filter(Boolean);
+    const existingLinks = await DesignFileLink.find(
+      { driveFileId: { $in: fileIds } },
+      { driveFileId: 1 }
+    ).lean();
+    const alreadyLinked = new Set(existingLinks.map((l) => l.driveFileId));
+    const toProcess = files.filter((f) => f.fileId && !alreadyLinked.has(f.fileId));
+
+    if (!toProcess.length) {
+      return res.json({ success: true, created: 0, message: 'All files already linked' });
+    }
+
+    const tempCustomer = await getOrCreateTempCustomer();
+    const results = [];
+
+    for (const file of toProcess) {
+      const orderNum = await nextOrderNumber();
+      const orderUuid = uuidv4();
+
+      const order = new Orders({
+        Order_uuid: orderUuid,
+        Order_Number: orderNum,
+        Customer_uuid: tempCustomer.Customer_uuid,
+        orderNote: `[TEMP] ${file.fileName || file.fileId}`,
+        orderMode: 'note',
+        stage: initialStage,
+        stageHistory: [{ stage: initialStage, timestamp: new Date() }],
+        priority: 'medium',
+        isTemporary: true,
+        driveFile: { status: 'skipped' },
+      });
+      await order.save();
+
+      await DesignFileLink.updateOne(
+        { driveFileId: file.fileId },
+        {
+          $set: {
+            orderUuid,
+            orderNumber: orderNum,
+            fileName: file.fileName || null,
+            stageNumber: file.stageNumber || null,
+            stageLabel: file.stageLabel || null,
+            linkedAt: new Date(),
+          },
+        },
+        { upsert: true }
+      );
+
+      results.push({ fileId: file.fileId, orderNumber: orderNum, orderUuid });
+    }
+
+    // Drive rename — isolated so it can never cause a 500 on the order creation
+    const renameResults = {};
+    try {
+      let drive = null;
+      try { drive = await getAuthorizedDriveClient(); } catch (_) { /* no Drive auth — skip */ }
+
+      if (drive) {
+        for (const result of results) {
+          const fileMeta = toProcess.find((f) => f.fileId === result.fileId);
+          const currentName = fileMeta?.fileName || '';
+
+          if (alreadyPrefixedWithOrder(currentName, result.orderNumber)) {
+            renameResults[result.fileId] = { status: 'skipped' };
+            continue;
+          }
+
+          const newName = `${result.orderNumber} - ${currentName}`;
+          try {
+            await drive.files.update({
+              fileId: result.fileId,
+              supportsAllDrives: true,
+              requestBody: { name: newName },
+              fields: 'id,name',
+            });
+            await DesignFileLink.updateOne({ driveFileId: result.fileId }, { $set: { fileName: newName } });
+            renameResults[result.fileId] = { status: 'renamed', newName };
+          } catch (renameErr) {
+            const msg = renameErr?.errors?.[0]?.message || renameErr?.message || 'Rename failed';
+            logger.warn('design-files/auto-temp-orders: Drive rename failed for %s — %s', result.fileId, msg);
+            renameResults[result.fileId] = { status: 'failed', error: msg };
+          }
+        }
+      }
+    } catch (renameBlockErr) {
+      logger.warn('design-files/auto-temp-orders: rename block error — %s', renameBlockErr?.message);
+    }
+
+    return res.json({ success: true, created: results.length, orders: results, renameResults });
+  } catch (err) {
+    logger.error({ err }, 'design-files/auto-temp-orders error');
+    return res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// ─── POST /api/design-files/auto-scan-link ───────────────────────────────────
+/**
+ * Called automatically from the frontend after every scan (stages 1-7).
+ * Creates a draft DesignFileLink the first time a file is seen, and on every
+ * subsequent call updates lastSeenAt (a heartbeat proving the file was still
+ * scanned) and, when the file's folder/stage has changed since the last scan,
+ * appends to fileStageHistory and resets stageEnteredAt. Without this update
+ * step a file's recorded stage/timestamps would freeze at whatever they were
+ * the first time it was spotted, which is why "how long has this file been
+ * stuck" was previously unanswerable from the data.
+ *
+ * Body: { files: [{ fileId, fileName, stageNumber, stageLabel }] }
+ */
+// Every new design file that syncs in from Drive is auto-assigned to this
+// Account Payable party by default (tagged with the 'design' capability,
+// same source as the design assign menu) — an admin can still reassign it,
+// but nothing should ever land unassigned. Resolved by name each call
+// (cheap single lookup) rather than cached, since which party holds this
+// name can change.
+const DEFAULT_DESIGN_ASSIGNEE_NAME = 'Sk Sai';
+
+router.post('/auto-scan-link', async (req, res) => {
+  try {
+    const { files = [] } = req.body || {};
+    if (!Array.isArray(files) || !files.length) {
+      return res.json({ success: true, updated: 0 });
+    }
+
+    const eligible = files.filter((f) => f.fileId && f.stageNumber >= 1 && f.stageNumber <= 7);
+    if (!eligible.length) {
+      return res.json({ success: true, updated: 0 });
+    }
+
+    const defaultAssignee = await Customers.findOne({
+      Customer_group: ACCOUNT_PAYABLE_GROUP,
+      Customer_name: new RegExp(`^${DEFAULT_DESIGN_ASSIGNEE_NAME}$`, 'i'),
+    }, { Customer_name: 1 }).lean();
+
+    const now = new Date();
+    const ops = eligible.map((f) => {
+      const isNewDocCondition = { $eq: [{ $ifNull: ['$firstSeenAt', null] }, null] };
+      return {
+        updateOne: {
+          filter: { driveFileId: f.fileId },
+          update: [
+            {
+              $set: {
+                fileName: f.fileName || null,
+                linkStatus: { $ifNull: ['$linkStatus', 'draft'] },
+                lastSeenAt: now,
+                firstSeenAt: { $ifNull: ['$firstSeenAt', now] },
+                stageEnteredAt: {
+                  $cond: [{ $eq: ['$stageNumber', f.stageNumber || null] }, { $ifNull: ['$stageEnteredAt', now] }, now],
+                },
+                fileStageHistory: {
+                  $cond: [
+                    { $eq: ['$stageNumber', f.stageNumber || null] },
+                    { $ifNull: ['$fileStageHistory', []] },
+                    {
+                      $concatArrays: [
+                        { $ifNull: ['$fileStageHistory', []] },
+                        [{ stageNumber: f.stageNumber || null, stageLabel: f.stageLabel || null, enteredAt: now }],
+                      ],
+                    },
+                  ],
+                },
+                stageNumber: f.stageNumber || null,
+                stageLabel: f.stageLabel || null,
+                ...(defaultAssignee ? {
+                  assignedTo: { $cond: [isNewDocCondition, defaultAssignee._id, '$assignedTo'] },
+                  assignedToType: { $cond: [isNewDocCondition, 'vendor', { $ifNull: ['$assignedToType', 'user'] }] },
+                  assignedToName: { $cond: [isNewDocCondition, defaultAssignee.Customer_name, '$assignedToName'] },
+                } : {}),
+              },
+            },
+          ],
+          upsert: true,
+        },
+      };
+    });
+
+    await DesignFileLink.bulkWrite(ops);
+
+    return res.json({ success: true, updated: eligible.length });
+  } catch (err) {
+    logger.error({ err }, 'design-files/auto-scan-link error');
+    return res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// ─── GET /api/design-files/pending ────────────────────────────────────────────
+/**
+ * "Not yet finalized" view — every tracked file still sitting in stages 1-4
+ * (i.e. not yet in Final/Printing and not yet confirmed as a real order),
+ * with aging computed from fileStageHistory/stageEnteredAt so stuck files are
+ * visible instead of looking identical to freshly-arrived ones.
+ */
+const AGING_HOURS = { amber: Number(process.env.STUCK_FILE_AMBER_HOURS || 48), red: Number(process.env.STUCK_FILE_RED_HOURS || 96) };
+
+router.get('/pending', async (_req, res) => {
+  try {
+    const links = await DesignFileLink.find({
+      linkStatus: { $ne: 'confirmed' },
+      stageNumber: { $gte: 1, $lte: 4 },
+    }).lean();
+
+    const now = Date.now();
+    const rows = links.map((l) => {
+      const stageHours = l.stageEnteredAt ? (now - new Date(l.stageEnteredAt).getTime()) / 3600000 : null;
+      const totalHours = l.firstSeenAt ? (now - new Date(l.firstSeenAt).getTime()) / 3600000 : null;
+      let severity = 'ok';
+      if (stageHours != null) {
+        if (stageHours >= AGING_HOURS.red) severity = 'red';
+        else if (stageHours >= AGING_HOURS.amber) severity = 'amber';
+      }
+      return {
+        driveFileId: l.driveFileId,
+        fileName: l.fileName,
+        stageNumber: l.stageNumber,
+        stageLabel: l.stageLabel,
+        linkStatus: l.linkStatus,
+        orderUuid: l.orderUuid,
+        orderNumber: l.orderNumber,
+        customerUuid: l.customerUuid,
+        customerName: l.customerName,
+        assignedToName: l.assignedToName,
+        firstSeenAt: l.firstSeenAt,
+        stageEnteredAt: l.stageEnteredAt,
+        lastSeenAt: l.lastSeenAt,
+        daysInStage: stageHours != null ? +(stageHours / 24).toFixed(1) : null,
+        daysSinceFirstSeen: totalHours != null ? +(totalHours / 24).toFixed(1) : null,
+        severity,
+        proofStatus: l.proofStatus,
+        proofRevisionCount: l.proofRevisionCount,
+        lastProofSentAt: l.lastProofSentAt,
+        lastCustomerResponseAt: l.lastCustomerResponseAt,
+      };
+    });
+
+    rows.sort((a, b) => (b.daysInStage || 0) - (a.daysInStage || 0));
+    return res.json({ success: true, count: rows.length, files: rows, thresholds: AGING_HOURS });
+  } catch (err) {
+    logger.error({ err }, 'design-files/pending error');
+    return res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// ─── POST /api/design-files/send-proof ───────────────────────────────────────
+/**
+ * Records that a proof was sent to the customer for a design file and
+ * notifies them over WhatsApp. Also creates/refreshes a follow-up Usertask
+ * for the assignee so a forgotten follow-up shows up on their task list
+ * instead of silently sitting until the customer happens to respond.
+ *
+ * Body: { fileId, fileName, orderUuid, orderNumber, customerUuid, customerName,
+ *         mobileNumber, note, mediaLink }
+ */
+router.post('/send-proof', async (req, res) => {
+  try {
+    const { fileId, fileName, orderUuid, orderNumber, customerUuid, customerName, mobileNumber, note, mediaLink } = req.body || {};
+    if (!fileId) return res.status(400).json({ success: false, message: 'fileId required' });
+
+    let mobile = normalizePhone(mobileNumber);
+    let resolvedCustomerName = customerName || null;
+    if (!mobile && customerUuid) {
+      const customer = await Customers.findOne({ Customer_uuid: customerUuid }).lean();
+      mobile = normalizePhone(customer?.Mobile_number);
+      resolvedCustomerName = resolvedCustomerName || customer?.Customer_name || null;
+    }
+    if (!mobile) {
+      return res.status(400).json({ success: false, message: 'A customer mobile number is required to send a proof' });
+    }
+
+    const link = await DesignFileLink.findOne({ driveFileId: fileId }).lean();
+    const revisionNumber = (link?.proofRevisionCount || 0) + 1;
+    const now = new Date();
+
+    const messageBody = [
+      `Hi ${resolvedCustomerName || ''},`.trim(),
+      `Here is the design proof${orderNumber ? ` for Order #${orderNumber}` : ''}${revisionNumber > 1 ? ` (revision ${revisionNumber})` : ''}.`,
+      note ? `Note: ${note}` : null,
+      mediaLink ? `View: ${mediaLink}` : null,
+      'Please reply with "OK" to approve, or let us know what changes you need.',
+    ].filter(Boolean).join('\n');
+
+    try {
+      await sendWhatsAppText({ to: mobile, body: messageBody, source: 'DESIGN_PROOF', activity: 'DESIGN_PROOF', contactName: resolvedCustomerName });
+    } catch (sendErr) {
+      logger.error({ err: sendErr }, 'design-files/send-proof: WhatsApp send failed');
+      return res.status(502).json({ success: false, message: sendErr.message || 'Failed to send WhatsApp message' });
+    }
+
+    await DesignFileLink.updateOne(
+      { driveFileId: fileId },
+      {
+        $set: {
+          fileName: fileName || link?.fileName || null,
+          orderUuid: orderUuid || link?.orderUuid || null,
+          orderNumber: orderNumber || link?.orderNumber || null,
+          customerUuid: customerUuid || link?.customerUuid || null,
+          customerName: resolvedCustomerName || link?.customerName || null,
+          proofStatus: 'awaiting_response',
+          proofRevisionCount: revisionNumber,
+          lastProofSentAt: now,
+          lastProofSentBy: req.user?._id || null,
+          lastNudgeAt: null,
+          nudgeCount: 0,
+        },
+      },
+      { upsert: true }
+    );
+
+    await DesignProofLog.create({
+      proofUuid: uuidv4(),
+      driveFileId: fileId,
+      fileName: fileName || link?.fileName || null,
+      orderUuid: orderUuid || link?.orderUuid || null,
+      orderNumber: orderNumber || link?.orderNumber || null,
+      customerUuid: customerUuid || link?.customerUuid || null,
+      customerName: resolvedCustomerName || link?.customerName || null,
+      mobileNumber: mobile,
+      revisionNumber,
+      sentAt: now,
+      sentBy: req.user?._id || null,
+      sentByName: req.user?.userName || req.user?.User_name || null,
+      note: note || '',
+      mediaLink: mediaLink || null,
+      status: 'awaiting_response',
+    });
+
+    // Follow-up reminder so a forgotten check-in surfaces on the assignee's
+    // task list instead of depending on someone remembering.
+    try {
+      const assigneeName = link?.assignedToName || req.user?.userName || req.user?.User_name || null;
+      if (assigneeName) {
+        const taskName = `Follow up on proof — ${fileName || link?.fileName || fileId}${orderNumber ? ` (Order #${orderNumber})` : ''}`;
+        const existing = await Usertasks.findOne({ Usertask_name: taskName, Status: { $in: ['Pending', 'pending'] } }).lean();
+        if (!existing) {
+          const nextNumber = await (async () => {
+            const doc = await Counter.findByIdAndUpdate('usertask_number', { $inc: { seq: 1 } }, { new: true, upsert: true, setDefaultsOnInsert: true }).lean();
+            return Number(doc?.seq || 1);
+          })();
+          await Usertasks.create({
+            Usertask_uuid: uuidv4(),
+            Usertask_Number: nextNumber,
+            User: assigneeName,
+            Usertask_name: taskName,
+            Date: now,
+            Time: now.toLocaleTimeString('en-US', { hour12: false }),
+            Deadline: new Date(now.getTime() + 24 * 60 * 60 * 1000),
+            Remark: `Proof sent to ${resolvedCustomerName || mobile}. Check for a response within 24h and follow up if there's none.`,
+            Status: 'Pending',
+          });
+        }
+      }
+    } catch (taskErr) {
+      logger.error({ err: taskErr }, 'design-files/send-proof: follow-up task creation failed (non-fatal)');
+    }
+
+    return res.json({ success: true, revisionNumber, proofStatus: 'awaiting_response' });
+  } catch (err) {
+    logger.error({ err }, 'design-files/send-proof error');
+    return res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// ─── POST /api/design-files/proof-response ───────────────────────────────────
+/**
+ * Manual override for recording how the customer responded to a proof, for
+ * when it comes in as a phone call or the auto-detected WhatsApp reply
+ * needs correcting.
+ *
+ * Body: { fileId, outcome: 'approved' | 'changes_requested', note }
+ */
+router.post('/proof-response', async (req, res) => {
+  try {
+    const { fileId, outcome, note } = req.body || {};
+    if (!fileId) return res.status(400).json({ success: false, message: 'fileId required' });
+    if (!['approved', 'changes_requested'].includes(outcome)) {
+      return res.status(400).json({ success: false, message: 'outcome must be approved or changes_requested' });
+    }
+
+    const now = new Date();
+    await DesignFileLink.updateOne(
+      { driveFileId: fileId },
+      { $set: { proofStatus: outcome, lastCustomerResponseAt: now } }
+    );
+
+    const latestProof = await DesignProofLog.findOne({ driveFileId: fileId }).sort({ sentAt: -1 });
+    if (latestProof) {
+      latestProof.status = outcome;
+      latestProof.respondedAt = now;
+      latestProof.responseNote = note || '';
+      latestProof.respondedVia = 'manual';
+      await latestProof.save();
+    }
+
+    return res.json({ success: true, proofStatus: outcome });
+  } catch (err) {
+    logger.error({ err }, 'design-files/proof-response error');
+    return res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// ─── POST /api/design-files/confirm-final ────────────────────────────────────
+/**
+ * Confirms a Final (stage 5) file as a real MIS order.
+ * Creates the order and renames the Drive file.
+ *
+ * Body: { fileId, fileName, customerUuid, itemDetails, mobileNumber, fromArchive }
+ * fromArchive: the file came from the Design Files "Archive" tab (already-
+ * printed historical jobs), so the new order skips design and starts at
+ * 'print' instead of the usual 'new_design'.
+ */
+router.post('/confirm-final', async (req, res) => {
+  try {
+    const { fileId, fileName, customerUuid, itemDetails, mobileNumber, orderMode, items, fromArchive } = req.body || {};
+    const initialStage = fromArchive ? 'print' : 'new_design';
+
+    if (!fileId) return res.status(400).json({ success: false, message: 'fileId required' });
+    if (!fileName) return res.status(400).json({ success: false, message: 'fileName required' });
+    if (!customerUuid) return res.status(400).json({ success: false, message: 'customerUuid required' });
+
+    const isDetailed = orderMode === 'items' && Array.isArray(items) && items.length > 0;
+    if (!isDetailed && !itemDetails) {
+      return res.status(400).json({ success: false, message: 'itemDetails required' });
+    }
+
+    const customer = await Customers.findOne({ Customer_uuid: customerUuid }).lean();
+    if (!customer) return res.status(404).json({ success: false, message: 'Customer not found' });
+
+    const orderNum = await nextOrderNumber();
+    const orderUuid = uuidv4();
+    const noteText = isDetailed ? '' : (itemDetails || '');
+    const firstItemName = isDetailed ? (items[0]?.itemName || items[0]?.Item_name || 'Design') : '';
+
+    const orderDoc = {
+      Order_uuid: orderUuid,
+      Order_Number: orderNum,
+      Customer_uuid: customerUuid,
+      orderNote: noteText,
+      orderMode: isDetailed ? 'items' : 'note',
+      Remark: noteText,
+      stage: initialStage,
+      priority: 'medium',
+      stageHistory: [{ stage: initialStage, timestamp: new Date() }],
+      driveFile: { status: 'skipped' },
+    };
+    if (isDetailed) {
+      orderDoc.items = items.map((it) => ({
+        Item_uuid: it.Item_uuid || uuidv4(),
+        Item_name: it.itemName || it.Item_name || '',
+        Quantity: Number(it.qty || 1),
+        Rate: Number(it.rate || 0),
+        Amount: Number(it.amount || 0),
+        Remark: '',
+      }));
+    }
+    const order = new Orders(orderDoc);
+    await order.save();
+
+    // Build new filename
+    const descPart = isDetailed ? sanitize(firstItemName) : sanitize(itemDetails);
+    const dotIdx = fileName.lastIndexOf('.');
+    const ext = dotIdx !== -1 ? fileName.slice(dotIdx + 1) : '';
+    const mobile = mobileNumber || customer.Mobile_number || '';
+    const newName = [
+      orderNum,
+      '-',
+      sanitize(customer.Customer_name),
+      '-',
+      descPart,
+      '-',
+      sanitize(mobile),
+    ].join(' ').replace(/\s+-\s+-\s+/g, ' - ') + (ext ? `.${ext}` : '');
+
+    // Upsert DesignFileLink
+    await DesignFileLink.updateOne(
+      { driveFileId: fileId },
+      {
+        $set: {
+          linkStatus: 'confirmed',
+          orderUuid,
+          orderNumber: orderNum,
+          customerUuid,
+          customerName: customer.Customer_name,
+          fileName: newName,
+          linkedAt: new Date(),
+        },
+      },
+      { upsert: true }
+    );
+
+    // Drive rename — isolated, never fails the confirm
+    let renamed = false;
+    const renameResults = {};
+    try {
+      let drive = null;
+      try { drive = await getAuthorizedDriveClient(); } catch (_) {}
+      if (drive) {
+        try {
+          await drive.files.update({
+            fileId,
+            supportsAllDrives: true,
+            requestBody: { name: newName },
+            fields: 'id,name',
+          });
+          await DesignFileLink.updateOne({ driveFileId: fileId }, { $set: { fileName: newName } });
+          renamed = true;
+          renameResults[fileId] = { status: 'renamed', newName };
+        } catch (renameErr) {
+          logger.warn('design-files/confirm-final: Drive rename failed for %s — %s', fileId, renameErr?.message);
+          await DesignFileLink.updateOne({ driveFileId: fileId }, { $set: { renameStatus: 'failed' } });
+          renameResults[fileId] = { status: 'failed', error: renameErr?.message };
+        }
+      }
+    } catch (renameBlockErr) {
+      logger.warn('rename block error — %s', renameBlockErr?.message);
+    }
+
+    const itemsTotal = isDetailed
+      ? (orderDoc.items || []).reduce((s, it) => s + (Number(it.Amount) || 0), 0)
+      : 0;
+    if (itemsTotal > 0) {
+      try {
+        await postCustomerInvoice({
+          amount: itemsTotal,
+          orderUuid,
+          orderNumber: orderNum,
+          customerUuid,
+          description: `Order #${orderNum} - ${customer.Customer_name}`,
+          sourceSuffix: orderUuid,
+        });
+      } catch (acctErr) {
+        logger.warn({ acctErr }, 'confirm-final accounting post failed (non-fatal)');
+      }
+    }
+
+    return res.json({ success: true, orderNumber: orderNum, orderUuid, newName, renamed });
+  } catch (err) {
+    logger.error({ err }, 'design-files/confirm-final error');
+    return res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// ─── POST /api/design-files/auto-print-job ───────────────────────────────────
+/**
+ * Auto-creates purchase orders for Printing (stage 6) files that don't have a
+ * print job yet.
+ *
+ * Body: { files: [{ fileId, fileName, orderUuid, orderNumber, stageNumber }] }
+ */
+router.post('/auto-print-job', async (req, res) => {
+  try {
+    const { files = [] } = req.body || {};
+    if (!Array.isArray(files) || !files.length) {
+      return res.json({ success: true, created: 0, jobs: [] });
+    }
+
+    const fileIds = files.map((f) => f.fileId).filter(Boolean);
+
+    // Filter out files that already have printJobId in DesignFileLink
+    const existingLinks = await DesignFileLink.find(
+      { driveFileId: { $in: fileIds }, printJobId: { $exists: true, $ne: null } },
+      { driveFileId: 1 }
+    ).lean();
+    const alreadyHasJob = new Set(existingLinks.map((l) => l.driveFileId));
+    const toProcess = files.filter((f) => f.fileId && !alreadyHasJob.has(f.fileId));
+
+    if (!toProcess.length) {
+      return res.json({ success: true, created: 0, jobs: [] });
+    }
+
+    const suspenseVendor = await getOrCreateSuspenseVendor();
+    const results = [];
+
+    for (const file of toProcess) {
+      const fileOrderUuid = file.orderUuid || '';
+      const fileOrderNumber = file.orderNumber || null;
+
+      const { job } = await upsertVendorJob({
+        jobCategory: 'printing',
+        vendorUuid: suspenseVendor.Vendor_uuid,
+        vendorName: suspenseVendor.Vendor_name,
+        orderUuid: fileOrderUuid,
+        orderNumber: fileOrderNumber,
+        jobType: 'printing',
+        amount: 1,
+        status: 'draft',
+        notes: file.fileName || file.fileId,
+        driveFileId: file.fileId,
+        postAccountingBill: false,
+        referenceType: 'print_job',
+      });
+
+      await DesignFileLink.updateOne(
+        { driveFileId: file.fileId },
+        {
+          $set: {
+            linkStatus: 'printing',
+            printJobId: job.job_uuid,
+            printJobNumber: job.job_number,
+          },
+        },
+        { upsert: true }
+      );
+
+      results.push({ fileId: file.fileId, printJobNumber: job.job_number, workUuid: job.job_uuid });
+    }
+
+    return res.json({ success: true, created: results.length, jobs: results });
+  } catch (err) {
+    logger.error({ err }, 'design-files/auto-print-job error');
+    return res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// ─── POST /api/design-files/update-print-job ─────────────────────────────────
+/**
+ * Updates an existing print job with real vendor and amount.
+ *
+ * Body: { printJobId, vendorUuid, amount, notes }
+ */
+router.post('/update-print-job', async (req, res) => {
+  try {
+    const { printJobId, vendorUuid, amount, notes } = req.body || {};
+
+    if (!printJobId) return res.status(400).json({ success: false, message: 'printJobId required' });
+    if (!vendorUuid) return res.status(400).json({ success: false, message: 'vendorUuid required' });
+    if (amount == null) return res.status(400).json({ success: false, message: 'amount required' });
+
+    const vendor = await VendorMaster.findOne({ Vendor_uuid: vendorUuid }).lean();
+    if (!vendor) return res.status(404).json({ success: false, message: 'Vendor not found' });
+
+    const resolvedAmount = Number(amount);
+
+    await upsertVendorJob({
+      jobCategory: 'printing',
+      jobUuid: printJobId,
+      vendorUuid: vendor.Vendor_uuid,
+      vendorName: vendor.Vendor_name,
+      amount: resolvedAmount,
+      notes: notes || undefined,
+      status: 'draft',
+      postAccountingBill: false,
+      referenceType: 'print_job',
+    });
+
+    return res.json({ success: true });
+  } catch (err) {
+    logger.error({ err }, 'design-files/update-print-job error');
+    return res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// ─── POST /api/design-files/rename-print-file ────────────────────────────────
+/**
+ * Renames a Printing file to "{orderNumber} - {vendorName} - PJ{jobNumber:03d} - {originalName}".
+ *
+ * Body: { fileId, orderNumber, vendorName, printJobNumber, originalFileName }
+ */
+router.post('/rename-print-file', async (req, res) => {
+  try {
+    const { fileId, orderNumber, vendorName, printJobNumber, originalFileName } = req.body || {};
+
+    if (!fileId) return res.status(400).json({ success: false, message: 'fileId required' });
+    if (!orderNumber) return res.status(400).json({ success: false, message: 'orderNumber required' });
+    if (!vendorName) return res.status(400).json({ success: false, message: 'vendorName required' });
+    if (printJobNumber == null) return res.status(400).json({ success: false, message: 'printJobNumber required' });
+    if (!originalFileName) return res.status(400).json({ success: false, message: 'originalFileName required' });
+
+    const newName = `${orderNumber} - ${sanitize(vendorName)} - PJ${String(printJobNumber).padStart(3, '0')} - ${sanitize(originalFileName)}`;
+
+    let renamed = false;
+    let status = 'failed';
+    let message = 'Drive rename not attempted';
+
+    const renameResults = {};
+    try {
+      let drive = null;
+      try { drive = await getAuthorizedDriveClient(); } catch (_) {}
+      if (drive) {
+        try {
+          await drive.files.update({
+            fileId,
+            supportsAllDrives: true,
+            requestBody: { name: newName },
+            fields: 'id,name',
+          });
+          await DesignFileLink.updateOne({ driveFileId: fileId }, { $set: { fileName: newName } });
+          renamed = true;
+          status = 'renamed';
+          message = 'File renamed successfully';
+          renameResults[fileId] = { status: 'renamed', newName };
+        } catch (renameErr) {
+          logger.warn('design-files/rename-print-file: Drive rename failed for %s — %s', fileId, renameErr?.message);
+          status = 'failed';
+          message = renameErr?.message || 'Rename failed';
+          renameResults[fileId] = { status: 'failed', error: renameErr?.message };
+        }
+      }
+    } catch (renameBlockErr) {
+      logger.warn('rename block error — %s', renameBlockErr?.message);
+    }
+
+    return res.json({ success: renamed, newName, status, message });
+  } catch (err) {
+    logger.error({ err }, 'design-files/rename-print-file error');
+    return res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// ─── GET /api/design-files/scan-archive ──────────────────────────────────────
+/**
+ * Scans the month-wise archive folder with 3-level traversal:
+ *   Archive Root → Month Folder → Date Subfolders → Final/Printing Subfolders → Files
+ *
+ * Returns data grouped by date for the frontend to render as collapsible date groups.
+ */
+
+/** Identify section type from archive subfolder name (Final / Printing) */
+function archiveSectionStage(name = '') {
+  const lower = name.toLowerCase();
+  if (lower.includes('final')) return 5;
+  if (lower.includes('print')) return 6;
+  return null;
+}
+
+router.get('/scan-archive', async (_req, res) => {
+  try {
+    const archiveFolderId = process.env.DRIVE_ARCHIVE_FOLDER_ID;
+    if (!archiveFolderId) {
+      return res.status(400).json({ success: false, message: 'DRIVE_ARCHIVE_FOLDER_ID not configured' });
+    }
+
+    const drive = await getAuthorizedDriveClient();
+
+    // 1. Get ALL month subfolders, sorted chronologically
+    const monthSubfolders = await listChildren(drive, archiveFolderId, 'application/vnd.google-apps.folder');
+    if (!monthSubfolders.length) {
+      return res.json({ success: true, months: [], dates: [], summary: { total: 0, unmatched: 0 } });
+    }
+
+    monthSubfolders.sort((a, b) => {
+      const [ya, ma] = monthFolderSortKey(a.name);
+      const [yb, mb] = monthFolderSortKey(b.name);
+      return ya !== yb ? ya - yb : ma - mb;
+    });
+
+    const allFilesFlat = [];
+    const allDateGroups = [];
+
+    // 2. For each month folder, scan all date subfolders
+    for (const monthFolder of monthSubfolders) {
+      const dateFolders = await listChildren(drive, monthFolder.id, 'application/vnd.google-apps.folder');
+      dateFolders.sort((a, b) => b.name.localeCompare(a.name));
+
+      const monthDateGroups = await Promise.all(
+        dateFolders.map(async (dateFolder) => {
+          const sectionFolders = await listChildren(drive, dateFolder.id, 'application/vnd.google-apps.folder');
+
+          const sections = await Promise.all(
+            sectionFolders.map(async (sectionFolder) => {
+              const sectionStageNum = archiveSectionStage(sectionFolder.name);
+              const files = await listChildren(drive, sectionFolder.id);
+              const mapped = files.map((file) => ({
+                fileId: file.id,
+                fileName: file.name,
+                modifiedTime: file.modifiedTime,
+                createdTime: file.createdTime,
+                size: file.size || null,
+                dateFolderName: dateFolder.name,
+                monthFolderName: monthFolder.name,
+                sectionFolderName: sectionFolder.name,
+                stageNumber: sectionStageNum,
+                stageLabel: sectionStageNum ? stageLabel(sectionStageNum) : sectionFolder.name,
+                stageColor: sectionStageNum ? stageColor(sectionStageNum) : null,
+                extractedOrderNumber: extractOrderNumber(file.name),
+              }));
+              allFilesFlat.push(...mapped);
+              return {
+                sectionName: sectionFolder.name,
+                stageNumber: sectionStageNum,
+                stageLabel: sectionStageNum ? stageLabel(sectionStageNum) : sectionFolder.name,
+                stageColor: sectionStageNum ? stageColor(sectionStageNum) : null,
+                files: mapped,
+              };
+            })
+          );
+
+          // Flat files directly in the date folder (no section subfolder)
+          const flatFiles = (await listChildren(drive, dateFolder.id)).filter(
+            (f) => f.mimeType !== 'application/vnd.google-apps.folder'
+          );
+          const flatMapped = flatFiles.map((file) => ({
+            fileId: file.id,
+            fileName: file.name,
+            modifiedTime: file.modifiedTime,
+            createdTime: file.createdTime,
+            size: file.size || null,
+            dateFolderName: dateFolder.name,
+            monthFolderName: monthFolder.name,
+            sectionFolderName: null,
+            stageNumber: null,
+            stageLabel: null,
+            stageColor: null,
+            extractedOrderNumber: extractOrderNumber(file.name),
+          }));
+          if (flatMapped.length) {
+            allFilesFlat.push(...flatMapped);
+            sections.push({ sectionName: 'Other', stageNumber: null, stageLabel: null, stageColor: null, files: flatMapped });
+          }
+
+          const fileCount = sections.reduce((s, sec) => s + sec.files.length, 0);
+          return {
+            dateName: dateFolder.name,
+            monthName: monthFolder.name,
+            dateFolderId: dateFolder.id,
+            sections: sections.filter((s) => s.files.length > 0),
+            fileCount,
+          };
+        })
+      );
+
+      allDateGroups.push(...monthDateGroups.filter((d) => d.fileCount > 0));
+    }
+
+    // Sort all date groups newest-first across all months
+    allDateGroups.sort((a, b) => {
+      const da = parseFolderDate(a.dateName);
+      const db = parseFolderDate(b.dateName);
+      if (!da && !db) return 0;
+      if (!da) return 1;
+      if (!db) return -1;
+      return db - da;
+    });
+
+    // 3. Batch-match by order number across all files
+    const orderNumbers = [...new Set(allFilesFlat.map((f) => f.extractedOrderNumber).filter(Boolean))];
+    const orders = orderNumbers.length
+      ? await Orders.find(
+          { Order_Number: { $in: orderNumbers } },
+          { Order_uuid: 1, Order_Number: 1, stage: 1, Amount: 1, isTemporary: 1, Customer_uuid: 1 }
+        ).lean()
+      : [];
+    const orderByNumber = {};
+    orders.forEach((o) => { orderByNumber[o.Order_Number] = o; });
+
+    const archiveCustomerUuids = [...new Set(orders.map((o) => o.Customer_uuid).filter(Boolean))];
+    const archiveCustomerNameByUuid = {};
+    if (archiveCustomerUuids.length) {
+      const customerDocs = await Customers.find(
+        { Customer_uuid: { $in: archiveCustomerUuids } },
+        { Customer_uuid: 1, Customer_name: 1 }
+      ).lean();
+      customerDocs.forEach((c) => { archiveCustomerNameByUuid[c.Customer_uuid] = c.Customer_name; });
+    }
+
+    function enrichFile(file) {
+      const order = file.extractedOrderNumber ? orderByNumber[file.extractedOrderNumber] || null : null;
+      return {
+        ...file,
+        matched: !!order,
+        orderUuid: order?.Order_uuid || null,
+        orderNumber: order?.Order_Number || file.extractedOrderNumber || null,
+        orderStage: order?.stage || null,
+        orderAmount: order?.Amount || null,
+        isTemporaryOrder: order?.isTemporary || false,
+        customerName: order ? archiveCustomerNameByUuid[order.Customer_uuid] || null : null,
+      };
+    }
+
+    // 4. Apply enrichment to the nested structure
+    const enrichedDates = allDateGroups.map((dateGroup) => ({
+      ...dateGroup,
+      sections: dateGroup.sections.map((section) => ({
+        ...section,
+        files: section.files.map(enrichFile),
+      })),
+    }));
+
+    // 5. Apply DesignFileLink matches for archive files
+    const allEnrichedFlat = enrichedDates.flatMap((d) => d.sections.flatMap((s) => s.files));
+    let linkedEnrichedFlat = await applyLinks(allEnrichedFlat);
+    linkedEnrichedFlat = await applyAssignments(linkedEnrichedFlat);
+    const linkedById = {};
+    linkedEnrichedFlat.forEach((f) => { linkedById[f.fileId] = f; });
+
+    const finalDates = enrichedDates.map((dateGroup) => ({
+      ...dateGroup,
+      sections: dateGroup.sections.map((section) => ({
+        ...section,
+        files: section.files.map((f) => linkedById[f.fileId] || f),
+      })),
+    }));
+
+    const summary = {
+      total: linkedEnrichedFlat.length,
+      matched: linkedEnrichedFlat.filter((f) => f.matched).length,
+      unmatched: linkedEnrichedFlat.filter((f) => !f.matched).length,
+    };
+
+    return res.json({
+      success: true,
+      months: monthSubfolders.map((m) => m.name),
+      dates: finalDates,
+      summary,
+    });
+  } catch (err) {
+    logger.error({ err }, 'design-files/scan-archive error');
+    if (err?.reconnectRequired) {
+      return res.status(401).json({ success: false, message: 'Google Drive disconnected. Please reconnect.', reconnectRequired: true });
+    }
+    return res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// ─── POST /api/design-files/create-print-job ─────────────────────────────────
+router.post('/create-print-job', async (req, res) => {
+  try {
+    const { orderUuid, vendorUuid, vendorName, items = [], totalAmount, notes } = req.body || {};
+
+    if (!vendorUuid) return res.status(400).json({ success: false, message: 'vendorUuid required' });
+    if (!items.length) return res.status(400).json({ success: false, message: 'items required' });
+
+    // Validate: orderUuid is required and must have a confirmed Final design file
+    if (!orderUuid) {
+      return res.status(422).json({ success: false, message: 'An order must be linked to create a print bill', code: 'ORDER_REQUIRED' });
+    }
+    const confirmedFinal = await DesignFileLink.findOne({ orderUuid, stageNumber: 5, linkStatus: 'confirmed' }).lean();
+    if (!confirmedFinal) {
+      const orderDoc = await Orders.findOne({ Order_uuid: orderUuid }, { Order_Number: 1 }).lean();
+      return res.status(422).json({
+        success: false,
+        message: `Order #${orderDoc?.Order_Number || orderUuid} has no confirmed Final design file. Confirm the Final design first before creating a print bill.`,
+        code: 'NO_CONFIRMED_FINAL',
+      });
+    }
+
+    const [order, vendorFromMaster, vendorFromCustomer] = await Promise.all([
+      orderUuid ? Orders.findOne({ Order_uuid: orderUuid }, { Order_uuid: 1, Order_Number: 1 }).lean() : null,
+      VendorMaster.findOne({ Vendor_uuid: vendorUuid }, { Vendor_uuid: 1, Vendor_name: 1 }).lean(),
+      Customers.findOne({ Customer_uuid: vendorUuid, PartyRoles: 'vendor' }, { Customer_uuid: 1, Customer_name: 1 }).lean(),
+    ]);
+    if (orderUuid && !order) return res.status(404).json({ success: false, message: 'Order not found' });
+    const vendorDoc = vendorFromMaster
+      ? { Vendor_uuid: vendorFromMaster.Vendor_uuid, Vendor_name: vendorFromMaster.Vendor_name }
+      : vendorFromCustomer
+        ? { Vendor_uuid: vendorFromCustomer.Customer_uuid, Vendor_name: vendorFromCustomer.Customer_name }
+        : null;
+    if (!vendorDoc) return res.status(404).json({ success: false, message: 'Vendor not found' });
+
+    const resolvedVendorName = vendorDoc.Vendor_name || vendorName || '';
+    const resolvedTotal = Number(totalAmount) || items.reduce((s, i) => s + (Number(i.amount) || 0), 0);
+
+    const { job } = await upsertVendorJob({
+      jobCategory: 'printing',
+      vendorUuid: vendorDoc.Vendor_uuid,
+      vendorName: resolvedVendorName,
+      orderUuid: order?.Order_uuid || '',
+      orderNumber: order?.Order_Number ?? null,
+      jobType: 'printing',
+      amount: resolvedTotal,
+      status: 'draft',
+      notes: notes || JSON.stringify(items.map((i) => ({
+        file: i.fileName, qty: i.qty, rate: i.rate, amount: i.amount,
+      }))),
+      postAccountingBill: true,
+      referenceType: 'print_job',
+    });
+
+    return res.json({
+      success: true,
+      workId: job._id,
+      printJobUuid: job.job_uuid,
+      totalAmount: resolvedTotal,
+      orderNumber: order?.Order_Number ?? null,
+    });
+  } catch (err) {
+    logger.error({ err }, 'design-files/create-print-job error');
+    return res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// ─── POST /api/design-files/validate-print-jobs ──────────────────────────────
+router.post('/validate-print-jobs', async (req, res) => {
+  try {
+    const { files = [] } = req.body || {};
+    const results = await Promise.all(
+      files.map(async (f) => {
+        if (!f.orderUuid) return { fileId: f.fileId, valid: false, reason: 'No order linked' };
+        const confirmed = await DesignFileLink.findOne({
+          orderUuid: f.orderUuid,
+          stageNumber: 5,
+          linkStatus: 'confirmed',
+        }).lean();
+        return {
+          fileId: f.fileId,
+          orderNumber: f.orderNumber,
+          valid: !!confirmed,
+          reason: confirmed ? null : `Order #${f.orderNumber || f.orderUuid} has no confirmed Final design file`,
+        };
+      })
+    );
+    return res.json({ results });
+  } catch (err) {
+    logger.error({ err }, 'design-files/validate-print-jobs error');
+    return res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// ─── Auto Purchase Order from Print Vendor Folders ───────────────────────────
+
+/**
+ * Parse "DD.MM.YYYY" from an archive date folder name into a UTC midnight Date.
+ * Returns null if the format is not recognised.
+ */
+function parseFolderDate(name = '') {
+  const m = String(name).match(/(\d{1,2})\.(\d{1,2})\.(\d{4})/);
+  if (!m) return null;
+  const d = new Date(`${m[3]}-${m[2].padStart(2, '0')}-${m[1].padStart(2, '0')}T00:00:00.000Z`);
+  return Number.isNaN(d.getTime()) ? null : d;
+}
+
+/** Sort key for month folder names like "04 April 2026" → [2026, 4]. */
+function monthFolderSortKey(name = '') {
+  const m = String(name).match(/^(\d+)\D+(\d{4})/);
+  return m ? [parseInt(m[2], 10), parseInt(m[1], 10)] : [0, 0];
+}
+
+/** Extract item name and qty from a print file name.
+ *  "banner=5.pdf" → { itemName: "banner", qty: 5 }
+ *  "visiting card=50.cdr" → { itemName: "visiting card", qty: 50 }
+ *  "flex.pdf" → { itemName: "flex", qty: 1 }
+ */
+function parsePrintFileName(rawName = '') {
+  const withoutExt = rawName.replace(/\.[^.]+$/, '').trim();
+  const m = withoutExt.match(/^(.+?)=(\d+(?:\.\d+)?)$/);
+  if (m) return { itemName: m[1].trim(), qty: Number(m[2]) };
+  return { itemName: withoutExt, qty: 1 };
+}
+
+/** Get next PO number using the shared counter. */
+async function nextAutoPONumber() {
+  const counter = await Counter.findByIdAndUpdate(
+    'purchase_order_number',
+    { $inc: { seq: 1 } },
+    { new: true, upsert: true, setDefaultsOnInsert: true }
+  ).lean();
+  return Number(counter?.seq || 1);
+}
+
+/**
+ * Find vendor by folder name (case-insensitive, first-word match).
+ * Creates a new vendor if none found.
+ */
+async function findOrCreateVendorByFolderName(folderName = '') {
+  const normalized = folderName.trim().toLowerCase();
+  // Exact match first
+  let vendor = await VendorMaster.findOne({
+    Vendor_name: { $regex: new RegExp(`^${normalized}$`, 'i') },
+    Active: true,
+  }).lean();
+  if (vendor) return vendor;
+
+  // Starts-with match (folderName is first word of vendor name)
+  vendor = await VendorMaster.findOne({
+    Vendor_name: { $regex: new RegExp(`^${normalized}\\b`, 'i') },
+    Active: true,
+  }).lean();
+  if (vendor) return vendor;
+
+  // Create new vendor using folder name as vendor name (capitalized)
+  const vendorName = folderName.trim().replace(/^\w/, (c) => c.toUpperCase());
+  const created = await VendorMaster.create({
+    Vendor_name: vendorName,
+    Vendor_type: 'jobwork',
+    Active: true,
+    Notes: `Auto-created from Drive print folder: ${folderName}`,
+  });
+  logger.info({ vendorName, folderName }, '[auto-po] Created new vendor from Drive folder');
+  return created.toObject ? created.toObject() : created;
+}
+
+/**
+ * Scans the archive Drive folder, finds Print vendor subfolders without a PO
+ * number prefix, creates PurchaseOrders, and renames the Drive folders.
+ * Called by the daily 12:00 PM scheduler and the manual POST /auto-po endpoint.
+ */
+async function autoPurchaseOrdersFromDrive() {
+  const archiveFolderId = process.env.DRIVE_ARCHIVE_FOLDER_ID;
+  if (!archiveFolderId) throw new Error('DRIVE_ARCHIVE_FOLDER_ID not configured');
+
+  const drive = await getAuthorizedDriveClient();
+
+  // Scan ALL month subfolders in the archive root, sorted chronologically
+  const monthSubfolders = await listChildren(drive, archiveFolderId, 'application/vnd.google-apps.folder');
+  if (!monthSubfolders.length) return [];
+
+  monthSubfolders.sort((a, b) => {
+    const [ya, ma] = monthFolderSortKey(a.name);
+    const [yb, mb] = monthFolderSortKey(b.name);
+    return ya !== yb ? ya - yb : ma - mb;
+  });
+
+  const results = [];
+
+  for (const monthFolder of monthSubfolders) {
+    const dateFolders = await listChildren(drive, monthFolder.id, 'application/vnd.google-apps.folder');
+
+    // Sort date folders chronologically by their DD.MM.YYYY name
+    dateFolders.sort((a, b) => {
+      const da = parseFolderDate(a.name);
+      const db = parseFolderDate(b.name);
+      if (!da && !db) return 0;
+      if (!da) return 1;
+      if (!db) return -1;
+      return da - db;
+    });
+
+    for (const dateFolder of dateFolders) {
+      const poDate = parseFolderDate(dateFolder.name);
+
+      const sectionFolders = await listChildren(drive, dateFolder.id, 'application/vnd.google-apps.folder');
+
+      // Find the Print section folder
+      const printSection = sectionFolders.find((f) => f.name.toLowerCase().includes('print'));
+      if (!printSection) continue;
+
+      // List vendor subfolders inside Print
+      const vendorFolders = await listChildren(drive, printSection.id, 'application/vnd.google-apps.folder');
+
+      for (const vendorFolder of vendorFolders) {
+        // Skip folders that already start with a digit — they already have a PO number prefix
+        if (/^\d/.test(vendorFolder.name)) continue;
+
+        const files = await listChildren(drive, vendorFolder.id);
+        if (!files.length) continue;
+
+        const items = files.map((f) => {
+          const { itemName, qty } = parsePrintFileName(f.name);
+          return { itemName, qty, unit: 'Nos', rate: 1, amount: qty * 1 };
+        });
+
+        let vendor;
+        try {
+          vendor = await findOrCreateVendorByFolderName(vendorFolder.name);
+        } catch (vendorErr) {
+          logger.error({ err: vendorErr.message, folder: vendorFolder.name }, '[auto-po] Vendor find/create failed');
+          results.push({ date: dateFolder.name, folder: vendorFolder.name, error: vendorErr.message });
+          continue;
+        }
+
+        let po;
+        let poNumber;
+        try {
+          poNumber = await nextAutoPONumber();
+          po = await PurchaseOrder.create({
+            PO_Number: poNumber,
+            Vendor_uuid: vendor.Vendor_uuid,
+            Vendor_name: vendor.Vendor_name,
+            Items: items,
+            poDate: poDate || new Date(),
+            status: 'draft',
+            notes: `Auto-created from Drive: ${monthFolder.name}/${dateFolder.name}/Print/${vendorFolder.name}`,
+            createdBy: 'system',
+          });
+          // Override Mongoose-managed createdAt to match the actual folder date
+          if (poDate) {
+            await PurchaseOrder.collection.updateOne(
+              { _id: po._id },
+              { $set: { createdAt: poDate } }
+            );
+          }
+        } catch (poErr) {
+          logger.error({ err: poErr.message, folder: vendorFolder.name }, '[auto-po] PO creation failed');
+          results.push({ date: dateFolder.name, folder: vendorFolder.name, error: poErr.message });
+          continue;
+        }
+
+        // Rename Drive folder: "101 Anand" (PO number space vendor name)
+        const newFolderName = `${poNumber} ${vendorFolder.name}`;
+        try {
+          await drive.files.update({
+            fileId: vendorFolder.id,
+            supportsAllDrives: true,
+            requestBody: { name: newFolderName },
+          });
+        } catch (renameErr) {
+          logger.warn({ err: renameErr.message, folder: vendorFolder.name }, '[auto-po] Drive folder rename failed');
+        }
+
+        logger.info({ poNumber, vendor: vendor.Vendor_name, itemCount: items.length, poDate }, '[auto-po] PO created');
+        results.push({
+          date: dateFolder.name,
+          month: monthFolder.name,
+          originalFolderName: vendorFolder.name,
+          newFolderName,
+          vendorName: vendor.Vendor_name,
+          poNumber,
+          poDate: poDate ? poDate.toISOString().slice(0, 10) : null,
+          itemCount: items.length,
+          poUuid: po.PO_uuid,
+        });
+      }
+    }
+  }
+
+  return results;
+}
+
+// POST /api/design-files/auto-po  — manual trigger
+router.post('/auto-po', async (_req, res) => {
+  try {
+    const results = await autoPurchaseOrdersFromDrive();
+    return res.json({ success: true, created: results.length, results });
+  } catch (err) {
+    logger.error({ err }, 'design-files/auto-po error');
+    if (err?.reconnectRequired) {
+      return res.status(401).json({ success: false, message: 'Google Drive disconnected. Please reconnect.', reconnectRequired: true });
+    }
+    return res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+module.exports = router;
+module.exports.autoPurchaseOrdersFromDrive = autoPurchaseOrdersFromDrive;

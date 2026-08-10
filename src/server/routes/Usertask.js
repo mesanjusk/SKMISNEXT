@@ -1,0 +1,126 @@
+const { requireAuth } = require('../middleware/auth');
+const express = require("express");
+const router = express.Router();
+const Usertasks = require("../repositories/usertask");
+const Counter = require("../repositories/counter");
+const { v4: uuid } = require("uuid");
+const { sendWhatsAppText } = require('../services/unifiedWhatsAppService');
+const normalizeWhatsAppNumber = require("../utils/normalizeNumber");
+const logger = require('../utils/logger');
+
+// Add new user task and optionally send WhatsApp message to user
+router.use(requireAuth);
+
+router.post("/addUsertask", async (req, res) => {
+  const { Usertask_name, User, Deadline, Remark } = req.body;
+  const assignedBy = req.user?.userName || req.user?.User_name || 'Admin';
+
+  try {
+    const data = await Usertasks.findOne({ Usertask_name });
+
+    if (data) {
+      return res.status(409).json({ success: false, message: "Task already exists" });
+    }
+
+    const taskCounter = await Counter.findByIdAndUpdate(
+      'usertask_number',
+      { $inc: { seq: 1 } },
+      { new: true, upsert: true, setDefaultsOnInsert: true }
+    ).lean();
+    const newTaskNumber = Number(taskCounter?.seq || 1);
+    const newTask = new Usertasks({
+      Usertask_name,
+      User,
+      AssignedBy: assignedBy,
+      Usertask_Number: newTaskNumber,
+      Date: new Date().toISOString().split("T")[0],
+      Time: new Date().toLocaleTimeString("en-US", { hour12: false }),
+      Usertask_uuid: uuid(),
+      Deadline,
+      Remark,
+      Status: "Pending"
+    });
+    await newTask.save();
+
+      // ✅ Format number before sending message
+      try {
+        const formattedNumber = normalizeWhatsAppNumber(User);
+        await sendWhatsAppText({
+          to: formattedNumber,
+          body: `Hello! Your task "${Usertask_name}" has been created and is pending. Deadline: ${Deadline || "N/A"}. Assigned by: ${assignedBy}`,
+          source: 'TASK_ASSIGNED',
+          activity: 'TASK_NOTIFICATIONS',
+          contactName: User || '',
+        });
+      } catch (err) {
+        logger.error("Failed to send WhatsApp message:", err.message);
+      }
+
+    res.status(201).json({ success: true, result: newTask });
+  } catch (e) {
+    logger.error("Error saving Task:", e);
+    res.status(500).json({ success: false, message: e.message || "Server error" });
+  }
+});
+
+// Direct WhatsApp message route
+router.post('/send-message', async (req, res) => {
+  const { mobile, message } = req.body;
+
+  if (!mobile || !message) {
+    return res.status(400).json({ error: 'Missing required fields' });
+  }
+
+  try {
+    const formattedMobile = normalizeWhatsAppNumber(mobile); // ✅ Format mobile number
+    const response = await sendWhatsAppText({ to: formattedMobile, body: message, source: 'TASK_MESSAGE', activity: 'TASK_NOTIFICATIONS' });
+    res.status(200).json(response);
+  } catch (error) {
+    logger.error('WhatsApp Send Error:', error);
+    res.status(500).json({ error: 'Failed to send message' });
+  }
+});
+
+// Get all user tasks
+router.get("/GetUsertaskList", async (req, res) => {
+  try {
+    let data = await Usertasks.find({}).lean();
+    if (data.length)
+      res.json({ success: true, result: data.filter((a) => a.Usertask_name) });
+    else res.status(404).json({ success: false, message: "Task Not found" });
+  } catch (err) {
+    logger.error("Error fetching Task:", err);
+    res.status(500).json({ success: false, message: err });
+  }
+});
+
+// Update a user task
+router.put("/update/:id", async (req, res) => {
+  const { id } = req.params;
+  const { Usertask_name, Usertask_Number, Deadline, Remark, Status } = req.body;
+
+  try {
+    const user = await Usertasks.findByIdAndUpdate(
+      id,
+      {
+        Usertask_name,
+        Usertask_Number,
+        Deadline,
+        Remark,
+        Status
+      },
+      { new: true }
+    );
+
+    if (!user) {
+      return res.status(404).json({ success: false, message: "Task not found" });
+    }
+
+    res.json({ success: true, result: user });
+  } catch (error) {
+    logger.error(error);
+    res.status(500).json({ success: false, message: "Server error" });
+  }
+});
+
+module.exports = router;

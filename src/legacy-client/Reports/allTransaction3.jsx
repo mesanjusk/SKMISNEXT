@@ -1,0 +1,474 @@
+// src/Pages/AllTransaction3.jsx
+import React, { useEffect, useMemo, useState } from 'react';
+
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+import axios from '../apiClient.js';
+import { useLocation, useNavigate } from 'react-router-dom';
+import toast from 'react-hot-toast';
+import AddOrder1 from "../Pages/addOrder1";
+import jsPDF from 'jspdf';
+import * as XLSX from 'xlsx';
+import { saveAs } from 'file-saver';
+
+// NEW: reusable modal
+import TransactionEditModal from '../Components/TransactionEditModal';
+
+const AllTransaction3 = () => {
+  const [transactions, setTransactions] = useState([]);
+  const [customers, setCustomers] = useState([]);
+  const [accounts, setAccounts] = useState([]);
+  const [loading, setLoading] = useState(false);
+  const [showOrderModal, setShowOrderModal] = useState(false);
+  const [sortConfig, setSortConfig] = useState({ key: 'Transaction_date', direction: 'asc' });
+  const [filterType, setFilterType] = useState("All");
+  const [startDate, setStartDate] = useState("");
+  const [endDate, setEndDate] = useState("");
+
+  // Admin-only actions
+  const [userRole, setUserRole] = useState('');
+
+  // Edit modal
+  const [showEditModal, setShowEditModal] = useState(false);
+  const [editingTxn, setEditingTxn] = useState(null);
+
+  const location = useLocation();
+  const navigate = useNavigate();
+  const { uuid: customerUuid, name: customerName } = location.state?.customer || {};
+
+  useEffect(() => {
+    if (!customerUuid || !customerName) {
+      toast.error("Customer not found. Redirecting...");
+      navigate("/allTransaction1");
+      return;
+    }
+
+    const role = localStorage.getItem('User_group') || '';
+    setUserRole(role);
+
+    const today = new Date();
+    const currentYear = today.getMonth() >= 3 ? today.getFullYear() : today.getFullYear() - 1;
+    setStartDate(`${currentYear}-04-01`);
+
+    const fetchData = async () => {
+      try {
+        setLoading(true);
+        const [transRes, custRes, acctRes] = await Promise.all([
+          axios.get('/api/transaction'),
+          axios.get('/api/customers/GetCustomersList'),
+          axios.get('/api/accounts'),
+        ]);
+        if (transRes.data?.success) setTransactions(transRes.data.result || []);
+        if (custRes.data?.success) setCustomers(custRes.data.result || []);
+        setAccounts(Array.isArray(acctRes.data?.accounts) ? acctRes.data.accounts : []);
+      } catch (error) {
+        console.error("Error fetching data:", error);
+      } finally {
+        setLoading(false);
+      }
+    };
+
+    fetchData();
+  }, [customerUuid, customerName, navigate]);
+
+  const customerMap = useMemo(() => {
+    const map = {};
+    for (const customer of customers) map[customer.Customer_uuid] = customer.Customer_name;
+    return map;
+  }, [customers]);
+
+  // UUID → name for chart-of-accounts entries
+  const accountMap = useMemo(() => {
+    const map = {};
+    for (const acct of accounts) map[acct.Account_uuid] = acct.Account_name;
+    return map;
+  }, [accounts]);
+
+  // Combined list for modal dropdowns: system accounts first, then customers
+  const accountOptions = useMemo(() => {
+    const opts = [];
+    for (const acct of accounts) opts.push({ uuid: acct.Account_uuid, name: acct.Account_name, group: 'Account' });
+    for (const cust of customers) opts.push({ uuid: cust.Customer_uuid, name: cust.Customer_name, group: 'Customer' });
+    return opts.sort((a, b) => a.name.localeCompare(b.name));
+  }, [accounts, customers]);
+
+  // Resolve any UUID to a display name (checks both customers and accounts)
+  const lookupName = (id) => customerMap[id] || accountMap[id] || id || '';
+
+  const customerTransactions = useMemo(
+    () =>
+      transactions.filter(t =>
+        (t.Journal_entry || []).some(e => e.Account_id === customerUuid)
+      ),
+    [transactions, customerUuid]
+  );
+
+  const openingBalance = useMemo(() => {
+    return customerTransactions.reduce((acc, transaction) => {
+      const txDate = new Date(transaction.Transaction_date);
+      if (!startDate || txDate < new Date(startDate)) {
+        (transaction.Journal_entry || []).forEach(entry => {
+          if (entry.Account_id === customerUuid) {
+            if (entry.Type === 'Debit') acc += entry.Amount || 0;
+            if (entry.Type === 'Credit') acc -= entry.Amount || 0;
+          }
+        });
+      }
+      return acc;
+    }, 0);
+  }, [customerTransactions, startDate, customerUuid]);
+
+  const filteredTransactions = useMemo(() => {
+    return customerTransactions.filter(transaction => {
+      const txDate = new Date(transaction.Transaction_date);
+      const withinDateRange =
+        (!startDate || new Date(startDate) <= txDate) &&
+        (!endDate || new Date(endDate) >= txDate);
+
+      const hasMatchingType = (transaction.Journal_entry || []).some(entry =>
+        entry.Account_id === customerUuid &&
+        (filterType === "All" || entry.Type === filterType)
+      );
+
+      return withinDateRange && hasMatchingType;
+    });
+  }, [customerTransactions, startDate, endDate, filterType, customerUuid]);
+
+  const sortedCustomerTransactions = useMemo(() => {
+    const list = [...filteredTransactions];
+    const { key, direction } = sortConfig;
+    if (!key) return list;
+
+    return list.sort((a, b) => {
+      let aVal = '', bVal = '';
+
+      if (key === "Name") {
+        const aLeg = (a.Journal_entry || []).find(e => e.Account_id !== customerUuid);
+        const bLeg = (b.Journal_entry || []).find(e => e.Account_id !== customerUuid);
+        aVal = (aLeg?.Account_name && !UUID_RE.test(aLeg.Account_name)) ? aLeg.Account_name : lookupName(aLeg?.Account_id);
+        bVal = (bLeg?.Account_name && !UUID_RE.test(bLeg.Account_name)) ? bLeg.Account_name : lookupName(bLeg?.Account_id);
+      } else if (key === "Transaction_date") {
+        aVal = new Date(a.Transaction_date).getTime();
+        bVal = new Date(b.Transaction_date).getTime();
+      } else {
+        aVal = a[key] || '';
+        bVal = b[key] || '';
+      }
+
+      if (typeof aVal === "string") {
+        return direction === "asc" ? aVal.localeCompare(bVal) : bVal.localeCompare(aVal);
+      }
+      return direction === "asc" ? aVal - bVal : bVal - aVal;
+    });
+  }, [filteredTransactions, sortConfig, customerUuid, customerMap]);
+
+  const calculateTotals = () => {
+    const totals = filteredTransactions.reduce(
+      (acc, transaction) => {
+        (transaction.Journal_entry || []).forEach(entry => {
+          if (entry.Account_id === customerUuid) {
+            if (entry.Type === 'Debit') acc.debit += entry.Amount || 0;
+            if (entry.Type === 'Credit') acc.credit += entry.Amount || 0;
+          }
+        });
+        return acc;
+      },
+      { debit: 0, credit: 0 }
+    );
+    totals.total = openingBalance + totals.debit - totals.credit;
+    return totals;
+  };
+
+  const totals = calculateTotals();
+
+  const sortTable = (key) => {
+    const direction = sortConfig.key === key && sortConfig.direction === 'asc' ? 'desc' : 'asc';
+    setSortConfig({ key, direction });
+  };
+
+  const handleExportPDF = () => {
+    const doc = new jsPDF();
+    doc.text(`Transactions for ${customerName}`, 10, 10);
+    let y = 20;
+    sortedCustomerTransactions.forEach((t, idx) => {
+      (t.Journal_entry || []).filter(e => e.Account_id === customerUuid).forEach(e => {
+        doc.text(`${idx + 1}. ${t.Description || ''} - ${e.Type}: ₹${e.Amount}`, 10, y);
+        y += 10;
+      });
+    });
+    doc.save('transactions.pdf');
+  };
+
+  const handleExportExcel = () => {
+    const rows = [];
+    sortedCustomerTransactions.forEach(transaction => {
+      (transaction.Journal_entry || [])
+        .filter(entry => entry.Account_id === customerUuid)
+        .forEach(entry => {
+          rows.push({
+            TransactionID: transaction.Transaction_id,
+            Date: new Date(transaction.Transaction_date).toLocaleDateString(),
+            Description: transaction.Description,
+            Type: entry.Type,
+            Amount: entry.Amount,
+          });
+        });
+    });
+
+    const worksheet = XLSX.utils.json_to_sheet(rows);
+    const workbook = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(workbook, worksheet, "Transactions");
+    const excelBuffer = XLSX.write(workbook, { bookType: 'xlsx', type: 'array' });
+    const data = new Blob([excelBuffer], { type: 'application/octet-stream' });
+    saveAs(data, "transactions.xlsx");
+  };
+
+  const handleOrder = () => setShowOrderModal(true);
+  const closeModal = () => setShowOrderModal(false);
+
+  // ---------- Admin-only: Edit/Delete ----------
+  const openEdit = (transaction) => {
+    setEditingTxn(transaction);   // store full transaction; modal derives its fields below
+    setShowEditModal(true);
+  };
+
+  const saveEditedTransaction = async (payload) => {
+    if (!editingTxn) return;
+    try {
+      const res = await axios.put(
+        `/api/transaction/${payload.Transaction_uuid}`,
+        {
+          Description:      payload.Description || editingTxn.Description || '',
+          Transaction_date: payload.Transaction_date,
+          Total_Debit:      Number(payload.Amount),
+          Total_Credit:     Number(payload.Amount),
+          Payment_mode:     editingTxn.Payment_mode || 'Journal',
+          Created_by:       editingTxn.Created_by   || '',
+          Order_uuid:       editingTxn.Order_uuid    || null,
+          Order_number:     editingTxn.Order_number  || null,
+          Customer_uuid:    editingTxn.Customer_uuid || null,
+          Journal_entry: [
+            { Account_id: payload.Debit_id,  Account_name: lookupName(payload.Debit_id),  Type: 'Debit',  Amount: Number(payload.Amount) },
+            { Account_id: payload.Credit_id, Account_name: lookupName(payload.Credit_id), Type: 'Credit', Amount: Number(payload.Amount) },
+          ],
+        }
+      );
+
+      if (res.data?.success) {
+        setTransactions(prev =>
+          prev.map(txn =>
+            txn.Transaction_uuid === payload.Transaction_uuid
+              ? {
+                  ...txn,
+                  Transaction_date: payload.Transaction_date,
+                  Description:      payload.Description,
+                  Total_Debit:      Number(payload.Amount),
+                  Total_Credit:     Number(payload.Amount),
+                  Journal_entry: [
+                    { Account_id: payload.Debit_id,  Account_name: lookupName(payload.Debit_id),  Type: 'Debit',  Amount: Number(payload.Amount) },
+                    { Account_id: payload.Credit_id, Account_name: lookupName(payload.Credit_id), Type: 'Credit', Amount: Number(payload.Amount) },
+                  ],
+                }
+              : txn
+          )
+        );
+        setShowEditModal(false);
+        setEditingTxn(null);
+        toast.success('Transaction updated');
+      } else {
+        toast.error('Update failed');
+      }
+    } catch (err) {
+      console.error(err);
+      toast.error('Error updating transaction');
+    }
+  };
+
+  const handleDelete = async (transaction) => {
+    if (!window.confirm('Are you sure you want to delete this transaction?')) return;
+    try {
+      const res = await axios.delete(`/api/transaction/${transaction.Transaction_uuid}`);
+      if (res.data?.success) {
+        setTransactions(prev => prev.filter(t => t.Transaction_uuid !== transaction.Transaction_uuid));
+      } else {
+        toast.error('Delete failed');
+      }
+    } catch (err) {
+      console.error(err);
+      toast.error('Error deleting transaction');
+    }
+  };
+  // ---------------------------------------------
+
+  return (
+    <>
+      <div className="no-print" />
+
+      <div className="pt-16 pb-24 px-4">
+        <div className="flex justify-between items-center mb-6">
+          <div>
+            <h2 className="text-xl font-bold">
+              <span className="text-blue-600">{customerName}</span>
+            </h2>
+          </div>
+          <div className="space-x-2">
+            <button onClick={handleExportPDF} className="px-4 py-1 bg-red-500 text-white rounded">PDF</button>
+            <button onClick={handleExportExcel} className="px-4 py-1 bg-blue-600 text-white rounded">Excel</button>
+          </div>
+        </div>
+
+        <div className="flex gap-4 mb-4 flex-wrap">
+          <div>
+            <label className="block text-sm font-medium">Start Date</label>
+            <input type="date" value={startDate} onChange={(e) => setStartDate(e.target.value)} className="border px-2 py-1 rounded" />
+          </div>
+          <div>
+            <label className="block text-sm font-medium">End Date</label>
+            <input type="date" value={endDate} onChange={(e) => setEndDate(e.target.value)} className="border px-2 py-1 rounded" />
+          </div>
+          <div>
+            <label className="block text-sm font-medium">Transaction Type</label>
+            <select value={filterType} onChange={(e) => setFilterType(e.target.value)} className="border px-2 py-1 rounded">
+              <option value="All">All</option>
+              <option value="Credit">Credit</option>
+              <option value="Debit">Debit</option>
+            </select>
+          </div>
+        </div>
+
+        <p>
+          Total Credit: ₹{totals.credit.toFixed(2)} |{' '}
+          Total Debit: ₹{totals.debit.toFixed(2)} |{' '}
+          Closing Balance: ₹{totals.total.toFixed(2)}
+        </p>
+
+        {loading ? (
+          <div className="text-center py-12 text-lg">Loading transactions...</div>
+        ) : (
+          <div className="overflow-x-auto">
+            <table className="min-w-full border-collapse">
+              <thead className="bg-gray-200">
+                <tr>
+                  <th className="py-2 px-4">No</th>
+                  <th className="py-2 px-4 cursor-pointer" onClick={() => sortTable("Transaction_date")}>
+                    Date {sortConfig.key === "Transaction_date" && (sortConfig.direction === "asc" ? "▲" : "▼")}
+                  </th>
+                  <th className="py-2 px-4 cursor-pointer" onClick={() => sortTable("Name")}>
+                    Name {sortConfig.key === "Name" && (sortConfig.direction === "asc" ? "▲" : "▼")}
+                  </th>
+                  <th className="py-2 px-4 cursor-pointer" onClick={() => sortTable("Description")}>
+                    Description {sortConfig.key === "Description" && (sortConfig.direction === "asc" ? "▲" : "▼")}
+                  </th>
+                  <th className="py-2 px-4">Debit</th>
+                  <th className="py-2 px-4">Credit</th>
+                  <th className="py-2 px-4">Balance</th>
+                  {/* Admin-only Actions column header */}
+                  {userRole === 'Admin User' && <th className="py-2 px-4 text-center">Actions</th>}
+                </tr>
+              </thead>
+
+              <tbody>
+                <tr className="bg-yellow-100 font-semibold">
+                  <td className="py-2 px-4" />
+                  <td className="py-2 px-4" />
+                  <td className="py-2 px-4" colSpan={1}>Opening Balance</td>
+                  <td className="py-2 px-4" />
+                  <td className="py-2 px-4" />
+                  <td className="py-2 px-4" />
+                  <td className="py-2 px-4">{openingBalance.toFixed(2)}</td>
+                  {userRole === 'Admin User' && <td className="py-2 px-4" />}
+                </tr>
+
+                {(() => {
+                  let runningBalance = openingBalance;
+                  return sortedCustomerTransactions.flatMap((transaction, index) =>
+                    (transaction.Journal_entry || [])
+                      .filter(entry => entry.Account_id === customerUuid)
+                      .map((entry, entryIndex) => {
+                        if (entry.Type === 'Debit') runningBalance += entry.Amount || 0;
+                        if (entry.Type === 'Credit') runningBalance -= entry.Amount || 0;
+
+                        const secondEntry = (transaction.Journal_entry || []).find(e => e.Account_id !== customerUuid);
+                        const secondCustomerName = secondEntry
+                          ? ((secondEntry.Account_name && !UUID_RE.test(secondEntry.Account_name))
+                              ? secondEntry.Account_name
+                              : (lookupName(secondEntry.Account_id) || 'N/A'))
+                          : 'N/A';
+
+                        return (
+                          <tr key={`${index}-${entryIndex}`} className="border-t hover:bg-gray-50">
+                            <td className="py-2 px-4">{transaction.Transaction_id}</td>
+                            <td className="py-2 px-4">{new Date(transaction.Transaction_date).toLocaleDateString()}</td>
+                            <td className="py-2 px-4">{secondCustomerName}</td>
+                            <td className="py-2 px-4">{transaction.Description}</td>
+                            <td className="py-2 px-4">{entry.Type === 'Debit' ? entry.Amount : ''}</td>
+                            <td className="py-2 px-4">{entry.Type === 'Credit' ? entry.Amount : ''}</td>
+                            <td className={`py-2 px-4 ${runningBalance >= 0 ? 'text-blue-600' : 'text-red-600'}`}>
+                              {runningBalance.toFixed(2)}
+                            </td>
+
+                            {/* Admin-only actions per transaction (edit/delete) */}
+                            {userRole === 'Admin User' && (
+                              <td className="py-2 px-4 text-center whitespace-nowrap">
+                                <button
+                                  className="text-blue-600 hover:underline mr-3"
+                                  onClick={() => openEdit(transaction)}
+                                >
+                                  Edit
+                                </button>
+                                <button
+                                  className="text-red-600 hover:underline"
+                                  onClick={() => handleDelete(transaction)}
+                                >
+                                  Delete
+                                </button>
+                              </td>
+                            )}
+                          </tr>
+                        );
+                      })
+                  );
+                })()}
+
+                <tr className="bg-blue-100 font-semibold">
+                  <td className="py-2 px-4" />
+                  <td className="py-2 px-4" />
+                  <td className="py-2 px-4" colSpan={1}>Closing Balance</td>
+                  <td className="py-2 px-4" />
+                  <td className="py-2 px-4">{totals.debit.toFixed(2)}</td>
+                  <td className="py-2 px-4">{totals.credit.toFixed(2)}</td>
+                  <td className="py-2 px-4">{totals.total.toFixed(2)}</td>
+                  {userRole === 'Admin User' && <td className="py-2 px-4" />}
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        )}
+      </div>
+
+      {/* Reusable edit modal (admin only) */}
+      <TransactionEditModal
+        open={userRole === 'Admin User' && showEditModal}
+        onClose={() => { setShowEditModal(false); setEditingTxn(null); }}
+        onSave={saveEditedTransaction}
+        initialData={editingTxn ? (() => {
+          const credit = (editingTxn.Journal_entry || []).find(e => String(e.Type || '').toLowerCase() === 'credit');
+          const debit  = (editingTxn.Journal_entry || []).find(e => String(e.Type || '').toLowerCase() === 'debit');
+          return {
+            Transaction_id:   editingTxn.Transaction_id,
+            Transaction_uuid: editingTxn.Transaction_uuid,
+            Transaction_date: editingTxn.Transaction_date,
+            Amount:      Number(credit?.Amount || debit?.Amount || 0),
+            Description: editingTxn.Description || '',
+            Credit_id:   credit?.Account_id || '',
+            Debit_id:    debit?.Account_id  || '',
+          };
+        })() : null}
+        accountOptions={accountOptions}
+      />
+
+      {showOrderModal && <AddOrder1 closeModal={closeModal} />}
+    </>
+  );
+};
+
+export default AllTransaction3;

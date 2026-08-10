@@ -1,0 +1,557 @@
+const express = require('express');
+const router = express.Router();
+const multer = require('multer');
+const { requireAuth } = require('../middleware/auth');
+const { v4: uuid } = require('uuid');
+const DiaryDraft = require('../repositories/diaryDraft');
+const Transaction = require('../repositories/transaction');
+const Counter = require('../repositories/counter');
+const Customer = require('../repositories/customer');
+const logger = require('../utils/logger');
+const { resolve: resolveAccount, getName: getAccountName, updateBalancesForJournal } = require('../services/accountRegistry');
+const { extractCsvFromFile } = require('../services/geminiOcrService');
+const { parseAmount: toAmt } = require('../utils/money');
+
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 20 * 1024 * 1024 }, // 20 MB
+  fileFilter: (_req, file, cb) => {
+    const allowed = ['image/jpeg', 'image/png', 'image/webp', 'image/heic', 'application/pdf'];
+    if (allowed.includes(file.mimetype)) return cb(null, true);
+    cb(new Error('Only JPG, PNG, WEBP, HEIC, or PDF files are allowed'));
+  },
+});
+
+router.use(requireAuth);
+
+// --------------- helpers ---------------
+
+function parseCsv(text) {
+  const lines = text.trim().split('\n').map((l) => l.trim()).filter(Boolean);
+  if (lines.length < 2) return [];
+  const headers = lines[0].split(',').map((h) => h.trim().toLowerCase());
+  return lines.slice(1).map((line) => {
+    const vals = line.split(',');
+    const row = {};
+    headers.forEach((h, i) => { row[h] = (vals[i] || '').trim(); });
+    return row;
+  });
+}
+
+const PAYMENT_MODE_MAP = { cash: 'Cash', cheque: 'Cheque', upi: 'UPI', neft: 'Bank', bank: 'Bank' };
+
+// --------------- account suggestion engine ---------------
+
+async function suggestAccountsForEntries(entries) {
+  if (!entries.length) return entries;
+
+  const ledgerDocs = await Customer.find(
+    { Customer_group: 'Bank and Account' },
+    { Customer_name: 1 }
+  ).lean();
+  const ledgerMap = {};
+  for (const doc of ledgerDocs) {
+    if (doc.Customer_name) ledgerMap[doc.Customer_name.toLowerCase()] = doc.Customer_name;
+  }
+
+  const results = await DiaryDraft.aggregate([
+    { $match: { status: 'confirmed' } },
+    { $unwind: '$entries' },
+    {
+      $match: {
+        'entries.entry_status':     'confirmed',
+        'entries.account_assigned': { $ne: '' },
+        'entries.party': {
+          $in: entries.map((e) => new RegExp(`^${e.party.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`, 'i')),
+        },
+      },
+    },
+    {
+      $group: {
+        _id: {
+          party:     { $toLower: '$entries.party' },
+          direction: '$entries.direction',
+          book:      '$entries.book',
+          account:   '$entries.account_assigned',
+        },
+        count:    { $sum: 1 },
+        lastUsed: { $max: '$diary_date' },
+      },
+    },
+    { $sort: { count: -1, lastUsed: -1 } },
+  ]);
+
+  const bestAccount = {};
+  for (const r of results) {
+    const key = `${r._id.party}|${r._id.direction}|${r._id.book}`;
+    if (!bestAccount[key]) {
+      bestAccount[key] = { account: r._id.account, count: r.count };
+    }
+  }
+
+  return entries.map((e) => {
+    const key = `${e.party.toLowerCase()}|${e.direction}|${e.book}`;
+    const historyMatch = bestAccount[key];
+    if (historyMatch) {
+      return {
+        ...e,
+        account_assigned:  historyMatch.account,
+        auto_suggested:    true,
+        suggestion_source: `used ${historyMatch.count}x in past`,
+      };
+    }
+    const nameMatch = ledgerMap[e.party.toLowerCase()];
+    if (nameMatch) {
+      return {
+        ...e,
+        account_assigned:  nameMatch,
+        auto_suggested:    true,
+        suggestion_source: 'party name matches account',
+      };
+    }
+    return e;
+  });
+}
+
+// --------------- routes ---------------
+
+// POST /api/diary/upload-image  — OCR via Gemini, returns extracted csv_text
+router.post('/upload-image', upload.single('file'), async (req, res) => {
+  try {
+    if (!req.file) {
+      return res.status(400).json({ success: false, message: 'No file uploaded' });
+    }
+    const csvText = await extractCsvFromFile(req.file.buffer, req.file.mimetype);
+    return res.json({ success: true, csv_text: csvText });
+  } catch (err) {
+    logger.error({ err }, 'POST /diary/upload-image');
+    const message = err.message?.includes('GEMINI_API_KEY')
+      ? 'Gemini API key not configured on server'
+      : err.message || 'OCR failed — please try again or upload CSV manually';
+    return res.status(500).json({ success: false, message });
+  }
+});
+
+// POST /api/diary/upload-csv
+router.post('/upload-csv', async (req, res) => {
+  try {
+    const { csv_text, uploaded_by } = req.body;
+    if (!csv_text || !uploaded_by) {
+      return res.status(400).json({ success: false, message: 'csv_text and uploaded_by are required' });
+    }
+
+    const rows = parseCsv(csv_text);
+    if (!rows.length) {
+      return res.status(400).json({ success: false, message: 'No valid rows found in CSV' });
+    }
+
+    const dateStr = rows[0]?.date;
+    if (!dateStr) {
+      return res.status(400).json({ success: false, message: '"date" column missing in CSV' });
+    }
+    const diaryDate = new Date(dateStr);
+    if (isNaN(diaryDate.getTime())) {
+      return res.status(400).json({ success: false, message: 'Invalid date format — use YYYY-MM-DD' });
+    }
+
+    let openingBalance = 0;
+    let closingBalance = 0;
+    const entries = [];
+
+    for (const row of rows) {
+      const timeSlot = (row.time || '').toUpperCase();
+      const amount = toAmt(row.amount);
+
+      if (timeSlot === 'OB') { openingBalance = amount; continue; }
+      if (timeSlot === 'CB') { closingBalance = amount; continue; }
+      if (!row.party || !amount) continue;
+
+      entries.push({
+        entry_uuid:       uuid(),
+        time_slot:        row.time || '',
+        party:            row.party,
+        amount,
+        direction:        (row.direction || 'in').toLowerCase() === 'out' ? 'out' : 'in',
+        book:             (row.book || 'cash').toLowerCase() === 'bank' ? 'bank' : 'cash',
+        mode:             (row.mode || 'cash').toLowerCase(),
+        checked:          (row.checked || '').toLowerCase() === 'yes',
+        notes:            row.notes || '',
+        account_assigned: '',
+        entry_status:     'draft',
+        transaction_uuid: null,
+      });
+    }
+
+    if (!entries.length) {
+      return res.status(400).json({ success: false, message: 'No valid entries found in CSV' });
+    }
+
+    const enrichedEntries = await suggestAccountsForEntries(entries);
+
+    const dayStart = new Date(dateStr + 'T00:00:00.000Z');
+    const dayEnd   = new Date(dateStr + 'T23:59:59.999Z');
+    const existing = await DiaryDraft.findOne({ diary_date: { $gte: dayStart, $lte: dayEnd } });
+
+    if (existing && existing.status === 'confirmed') {
+      return res.status(409).json({ success: false, message: 'Diary for this date is already confirmed and cannot be re-uploaded.' });
+    }
+
+    if (existing) {
+      existing.entries          = enrichedEntries;
+      existing.opening_balance  = openingBalance;
+      existing.closing_balance  = closingBalance;
+      existing.uploaded_by      = uploaded_by;
+      existing.status           = 'draft';
+      await existing.save();
+      return res.json({ success: true, message: 'Diary draft updated', result: existing });
+    }
+
+    const draft = new DiaryDraft({
+      diary_uuid:      uuid(),
+      diary_date:      diaryDate,
+      status:          'draft',
+      uploaded_by,
+      opening_balance: openingBalance,
+      closing_balance: closingBalance,
+      entries:         enrichedEntries,
+    });
+    await draft.save();
+    return res.status(201).json({ success: true, message: 'Diary draft created', result: draft });
+  } catch (err) {
+    logger.error({ err }, 'POST /diary/upload-csv');
+    return res.status(500).json({ success: false, message: 'Internal server error' });
+  }
+});
+
+// GET /api/diary  — list all, newest first
+router.get('/', async (req, res) => {
+  try {
+    const drafts = await DiaryDraft.find({}, { entries: 0 }).sort({ diary_date: -1 }).lean();
+    return res.json({ success: true, result: drafts });
+  } catch (err) {
+    logger.error({ err }, 'GET /diary');
+    return res.status(500).json({ success: false, message: 'Internal server error' });
+  }
+});
+
+async function getCashBankAccounts() {
+  const docs = await Customer.find(
+    { Customer_group: 'Bank and Account' },
+    { Customer_name: 1, Customer_uuid: 1 }
+  ).lean();
+  const cashDocs = docs.filter((d) => d.Customer_name && /cash/i.test(d.Customer_name));
+  const bankDocs = docs.filter((d) => d.Customer_name && !/cash/i.test(d.Customer_name));
+  const cashUuids = cashDocs.map((d) => d.Customer_uuid).filter(Boolean);
+  const bankUuids = bankDocs.map((d) => d.Customer_uuid).filter(Boolean);
+  const cashNames = cashDocs.map((d) => d.Customer_name);
+  const bankNames = bankDocs.map((d) => d.Customer_name);
+  return {
+    cashAccounts: cashUuids,
+    cashNames,
+    bankAccounts: bankUuids,
+    bankNames,
+    all: [...cashUuids, ...bankUuids, ...cashNames, ...bankNames],
+  };
+}
+
+// GET /api/diary/ledger-dates
+router.get('/ledger-dates', async (req, res) => {
+  try {
+    const now = new Date();
+    const fyYear = now.getMonth() >= 3 ? now.getFullYear() : now.getFullYear() - 1;
+    const fyStart = new Date(`${fyYear}-04-01T00:00:00.000Z`);
+
+    const { all: targetAccounts } = await getCashBankAccounts();
+    if (!targetAccounts.length) {
+      return res.json({ success: true, result: [] });
+    }
+
+    const dates = await Transaction.aggregate([
+      {
+        $match: {
+          Transaction_date: { $gte: fyStart },
+          'Journal_entry.Account_id': { $in: targetAccounts },
+        },
+      },
+      {
+        $group: {
+          _id: { $dateToString: { format: '%Y-%m-%d', date: '$Transaction_date' } },
+        },
+      },
+      { $sort: { _id: -1 } },
+    ]);
+
+    return res.json({ success: true, result: dates.map((d) => d._id) });
+  } catch (err) {
+    logger.error({ err }, 'GET /diary/ledger-dates');
+    return res.status(500).json({ success: false, message: 'Internal server error' });
+  }
+});
+
+// GET /api/diary/ledger?date=YYYY-MM-DD
+router.get('/ledger', async (req, res) => {
+  try {
+    const { date } = req.query;
+    if (!date) return res.status(400).json({ success: false, message: 'date query param required (YYYY-MM-DD)' });
+
+    const dayStart = new Date(`${date}T00:00:00.000Z`);
+    const dayEnd   = new Date(`${date}T23:59:59.999Z`);
+
+    const { cashAccounts, cashNames, bankAccounts, bankNames, all: targetAccounts } = await getCashBankAccounts();
+
+    const txns = await Transaction.find({
+      Transaction_date: { $gte: dayStart, $lte: dayEnd },
+      'Journal_entry.Account_id': { $in: targetAccounts },
+    })
+      .sort({ Transaction_id: 1 })
+      .lean();
+
+    return res.json({ success: true, result: txns, meta: { cashAccounts, cashNames, bankAccounts, bankNames } });
+  } catch (err) {
+    logger.error({ err }, 'GET /diary/ledger');
+    return res.status(500).json({ success: false, message: 'Internal server error' });
+  }
+});
+
+// POST /api/diary/create — create empty draft (no CSV needed, date optional)
+router.post('/create', async (req, res) => {
+  try {
+    const { uploaded_by, diary_date, opening_balance, closing_balance } = req.body;
+    if (!uploaded_by) return res.status(400).json({ success: false, message: 'uploaded_by required' });
+
+    const draft = new DiaryDraft({
+      diary_uuid:      uuid(),
+      diary_date:      diary_date ? new Date(diary_date) : null,
+      status:          'draft',
+      uploaded_by,
+      opening_balance: toAmt(opening_balance),
+      closing_balance: toAmt(closing_balance),
+      entries:         [],
+    });
+    await draft.save();
+    return res.status(201).json({ success: true, message: 'Diary draft created', result: draft });
+  } catch (err) {
+    logger.error({ err }, 'POST /diary/create');
+    return res.status(500).json({ success: false, message: 'Internal server error' });
+  }
+});
+
+// GET /api/diary/:uuid
+router.get('/:uuid', async (req, res) => {
+  try {
+    const draft = await DiaryDraft.findOne({ diary_uuid: req.params.uuid }).lean();
+    if (!draft) return res.status(404).json({ success: false, message: 'Diary not found' });
+    return res.json({ success: true, result: draft });
+  } catch (err) {
+    logger.error({ err }, 'GET /diary/:uuid');
+    return res.status(500).json({ success: false, message: 'Internal server error' });
+  }
+});
+
+// PUT /api/diary/:uuid/entry/:entryUuid
+router.put('/:uuid/entry/:entryUuid', async (req, res) => {
+  try {
+    const { account_assigned, entry_status, notes } = req.body;
+    const draft = await DiaryDraft.findOne({ diary_uuid: req.params.uuid });
+    if (!draft) return res.status(404).json({ success: false, message: 'Diary not found' });
+    if (draft.status === 'confirmed') {
+      return res.status(400).json({ success: false, message: 'Diary is already confirmed' });
+    }
+
+    const setFields = {};
+    if (account_assigned !== undefined) {
+      setFields['entries.$[e].account_assigned'] = account_assigned;
+      setFields['entries.$[e].auto_suggested']    = false;
+      setFields['entries.$[e].suggestion_source'] = '';
+    }
+    if (entry_status !== undefined) setFields['entries.$[e].entry_status'] = entry_status;
+    if (notes        !== undefined) setFields['entries.$[e].notes']        = notes;
+
+    await DiaryDraft.updateOne(
+      { diary_uuid: req.params.uuid },
+      { $set: setFields },
+      { arrayFilters: [{ 'e.entry_uuid': req.params.entryUuid }] }
+    );
+
+    const updated = await DiaryDraft.findOne({ diary_uuid: req.params.uuid }).lean();
+    return res.json({ success: true, result: updated });
+  } catch (err) {
+    logger.error({ err }, 'PUT /diary/:uuid/entry/:entryUuid');
+    return res.status(500).json({ success: false, message: 'Internal server error' });
+  }
+});
+
+// POST /api/diary/:uuid/entry — add a new entry to a draft diary
+router.post('/:uuid/entry', async (req, res) => {
+  try {
+    const draft = await DiaryDraft.findOne({ diary_uuid: req.params.uuid });
+    if (!draft) return res.status(404).json({ success: false, message: 'Diary not found' });
+    if (draft.status === 'confirmed') {
+      return res.status(400).json({ success: false, message: 'Diary is confirmed. Reopen it first to add entries.' });
+    }
+
+    const { party, amount, direction, book, mode, notes } = req.body;
+    if (!party || !amount) return res.status(400).json({ success: false, message: 'party and amount are required' });
+
+    const newEntry = {
+      entry_uuid:       uuid(),
+      time_slot:        '',
+      party:            party.trim(),
+      amount:           toAmt(amount),
+      direction:        direction === 'out' ? 'out' : 'in',
+      book:             book === 'bank' ? 'bank' : 'cash',
+      mode:             (mode || 'cash').toLowerCase(),
+      checked:          false,
+      notes:            notes || '',
+      account_assigned: '',
+      entry_status:     'draft',
+      transaction_uuid: null,
+    };
+
+    const [enriched] = await suggestAccountsForEntries([newEntry]);
+    draft.entries.push(enriched || newEntry);
+    draft.markModified('entries');
+    await draft.save();
+    return res.json({ success: true, result: draft });
+  } catch (err) {
+    logger.error({ err }, 'POST /diary/:uuid/entry');
+    return res.status(500).json({ success: false, message: 'Internal server error' });
+  }
+});
+
+// PUT /api/diary/:uuid — update diary metadata (date, balances)
+router.put('/:uuid', async (req, res) => {
+  try {
+    const { diary_date, opening_balance, closing_balance } = req.body;
+    const draft = await DiaryDraft.findOne({ diary_uuid: req.params.uuid });
+    if (!draft) return res.status(404).json({ success: false, message: 'Diary not found' });
+
+    if (diary_date !== undefined) {
+      draft.diary_date = (diary_date && diary_date !== '') ? new Date(diary_date) : null;
+    }
+    if (opening_balance !== undefined) draft.opening_balance = toAmt(opening_balance);
+    if (closing_balance !== undefined) draft.closing_balance = toAmt(closing_balance);
+    await draft.save();
+    return res.json({ success: true, result: draft });
+  } catch (err) {
+    logger.error({ err }, 'PUT /diary/:uuid');
+    return res.status(500).json({ success: false, message: 'Internal server error' });
+  }
+});
+
+// POST /api/diary/:uuid/reopen — reopen a confirmed diary for editing
+router.post('/:uuid/reopen', async (req, res) => {
+  try {
+    const draft = await DiaryDraft.findOne({ diary_uuid: req.params.uuid });
+    if (!draft) return res.status(404).json({ success: false, message: 'Diary not found' });
+    if (draft.status !== 'confirmed') {
+      return res.status(400).json({ success: false, message: 'Diary is not confirmed' });
+    }
+    draft.status = 'draft';
+    draft.entries.forEach((entry) => {
+      if (entry.entry_status === 'confirmed') entry.entry_status = 'draft';
+    });
+    draft.markModified('entries');
+    await draft.save();
+    return res.json({ success: true, result: draft });
+  } catch (err) {
+    logger.error({ err }, 'POST /diary/:uuid/reopen');
+    return res.status(500).json({ success: false, message: 'Internal server error' });
+  }
+});
+
+// POST /api/diary/:uuid/confirm
+router.post('/:uuid/confirm', async (req, res) => {
+  try {
+    const { confirmed_by } = req.body;
+    const draft = await DiaryDraft.findOne({ diary_uuid: req.params.uuid });
+    if (!draft) return res.status(404).json({ success: false, message: 'Diary not found' });
+    if (draft.status === 'confirmed') {
+      return res.status(400).json({ success: false, message: 'Diary is already confirmed' });
+    }
+
+    const { cashAccounts, bankAccounts } = await getCashBankAccounts();
+    const cashUuid = cashAccounts[0] || 'Cash';
+    const bankUuid = bankAccounts[0] || 'Bank';
+
+    let created = 0;
+    for (const entry of draft.entries) {
+      if (entry.entry_status === 'rejected') continue;
+      if (!entry.account_assigned)           continue;
+
+      const ledgerAccountUuid = entry.book === 'bank' ? bankUuid : cashUuid;
+      const ledgerAccountName = await getAccountName(ledgerAccountUuid);
+
+      const assignedAcct = await resolveAccount(entry.account_assigned);
+      if (assignedAcct.name === assignedAcct.uuid) {
+        logger.error(`Diary confirm: cannot resolve name for account_assigned '${entry.account_assigned}' — skipping entry`);
+        continue;
+      }
+
+      const journal = entry.direction === 'in'
+        ? [
+            { Account_id: ledgerAccountUuid,   Account_name: ledgerAccountName,   Type: 'Debit',  Amount: entry.amount },
+            { Account_id: assignedAcct.uuid,   Account_name: assignedAcct.name,   Type: 'Credit', Amount: entry.amount },
+          ]
+        : [
+            { Account_id: assignedAcct.uuid,   Account_name: assignedAcct.name,   Type: 'Debit',  Amount: entry.amount },
+            { Account_id: ledgerAccountUuid,   Account_name: ledgerAccountName,   Type: 'Credit', Amount: entry.amount },
+          ];
+
+      const counter = await Counter.findByIdAndUpdate(
+        'transaction_number',
+        { $inc: { seq: 1 } },
+        { new: true, upsert: true, setDefaultsOnInsert: true }
+      ).lean();
+
+      const paymentMode = PAYMENT_MODE_MAP[entry.mode] || 'Cash';
+      const description = [entry.party, entry.notes].filter(Boolean).join(' - ');
+
+      const txn = new Transaction({
+        Transaction_uuid: uuid(),
+        Transaction_id:   Number(counter?.seq || 1),
+        Transaction_date: draft.diary_date || new Date(),
+        Description:      description,
+        Total_Debit:      entry.amount,
+        Total_Credit:     entry.amount,
+        Payment_mode:     paymentMode,
+        Created_by:       confirmed_by || 'diary',
+        Journal_entry:    journal,
+        Source:           'diary',
+      });
+      await txn.save();
+
+      updateBalancesForJournal(journal).catch(() => {});
+
+      entry.transaction_uuid = txn.Transaction_uuid;
+      entry.entry_status     = 'confirmed';
+      created++;
+    }
+
+    draft.status = 'confirmed';
+    draft.markModified('entries');
+    await draft.save();
+    return res.json({ success: true, message: `${created} transaction(s) created`, result: draft });
+  } catch (err) {
+    logger.error({ err }, 'POST /diary/:uuid/confirm');
+    return res.status(500).json({ success: false, message: 'Internal server error' });
+  }
+});
+
+// DELETE /api/diary/:uuid
+router.delete('/:uuid', async (req, res) => {
+  try {
+    const draft = await DiaryDraft.findOne({ diary_uuid: req.params.uuid });
+    if (!draft) return res.status(404).json({ success: false, message: 'Diary not found' });
+    if (draft.status === 'confirmed') {
+      return res.status(400).json({ success: false, message: 'Cannot delete a confirmed diary' });
+    }
+    await DiaryDraft.deleteOne({ diary_uuid: req.params.uuid });
+    return res.json({ success: true, message: 'Diary draft deleted' });
+  } catch (err) {
+    logger.error({ err }, 'DELETE /diary/:uuid');
+    return res.status(500).json({ success: false, message: 'Internal server error' });
+  }
+});
+
+module.exports = router;

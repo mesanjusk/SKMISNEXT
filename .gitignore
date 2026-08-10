@@ -1,0 +1,50 @@
+# Dependencies
+node_modules/
+.pnp
+.pnp.js
+
+# Next.js build output
+.next/
+out/
+build/
+dist/
+
+# Env files
+.env
+.env.local
+.env.*.local
+.env.production
+*.json.key
+service-account*.json
+mis-auto-*.json
+
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Editor / OS
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+.claude/
+
+# Test/coverage
+coverage/
+
+# Audit / one-off migration report docs — generated during development,
+# not part of the app; never commit these.
+*AUDIT*.md
+*_AUDIT_REPORT*.md
+*IMPROVEMENT_REPORT*.md
+*ARCHITECTURE_CONSOLIDATION_PLAN*.md
+AUDIT_*.md
