@@ -8,6 +8,7 @@
   },
   "scripts": {
     "dev": "cross-env NODE_ENV=development node server.js",
+    "prebuild": "node scripts/write-version.js",
     "build": "next build",
     "start": "cross-env NODE_ENV=production node server.js",
     "lint": "eslint .",
