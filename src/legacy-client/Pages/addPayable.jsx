@@ -43,6 +43,7 @@ export default function AddTransaction() {
   const [accountCustomerOptions, setAccountCustomerOptions] = useState([]);
   const [loggedInUser, setLoggedInUser] = useState('');
   const [filteredOptions, setFilteredOptions] = useState([]);
+  const [accountFilter, setAccountFilter] = useState('all');
   const [Customer_name, setCustomer_Name] = useState('');
   const [selectedImage, setSelectedImage] = useState(null);
   const [mobileToSend, setMobileToSend] = useState('');
@@ -84,6 +85,15 @@ export default function AddTransaction() {
         console.error('Error fetching customer options:', err);
       });
   }, []);
+
+  const filteredAccountOptions = useMemo(() => {
+    const query = Customer_name.trim().toLowerCase();
+    return accountCustomerOptions.filter((option) => {
+      const matchesSearch = !query || option.Customer_name?.toLowerCase().includes(query);
+      const matchesAccount = accountFilter === 'all' || option.Customer_uuid === accountFilter;
+      return matchesSearch && matchesAccount;
+    });
+  }, [accountCustomerOptions, Customer_name, accountFilter]);
 
   const selectedCustomer = useMemo(
     () => allCustomerOptions.find((option) => option.Customer_uuid === customers) || null,
@@ -206,7 +216,7 @@ export default function AddTransaction() {
     setCustomer_Name(value);
 
     if (value) {
-      const filtered = allCustomerOptions.filter((option) =>
+      const filtered = accountCustomerOptions.filter((option) =>
         option.Customer_name.toLowerCase().includes(value.toLowerCase()));
       setFilteredOptions(filtered);
     } else {
@@ -242,6 +252,19 @@ export default function AddTransaction() {
               sx={compactFieldSx}
             />
             <TextField
+              label="Filter by Account"
+              select
+              value={accountFilter}
+              onChange={(e) => setAccountFilter(e.target.value)}
+              size="small"
+              sx={compactFieldSx}
+            >
+              <MenuItem value="all">All Accounts</MenuItem>
+              {accountCustomerOptions.map((option) => (
+                <MenuItem key={option.Customer_uuid} value={option.Customer_uuid}>{option.Customer_name}</MenuItem>
+              ))}
+            </TextField>
+            <TextField
               label="Matched Accounts"
               select
               value={customers}
@@ -250,7 +273,7 @@ export default function AddTransaction() {
               sx={compactFieldSx}
             >
               <MenuItem value="">Select Account</MenuItem>
-              {(filteredOptions.length ? filteredOptions : accountCustomerOptions).map((option) => (
+              {(filteredOptions.length ? filteredOptions : filteredAccountOptions).map((option) => (
                 <MenuItem key={option.Customer_uuid} value={option.Customer_uuid}>{option.Customer_name}</MenuItem>
               ))}
             </TextField>
